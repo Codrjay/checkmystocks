@@ -1,0 +1,1286 @@
+Checkmystocks App =
+VAR _InventoryValue = [Inventory Value]
+VAR _DeadStockValue = [Dead Stock Value]
+VAR _OutOfStock = [Out-of-Stock Products]
+VAR _Turnover = [Inventory Turnover]
+VAR _Revenue = [Revenue]
+VAR _COGS = [COGS]
+VAR _Margin = [Gross Margin %]
+VAR _CurrencyFormat = "₦#,##0"
+VAR _DeadStockPct = DIVIDE(_DeadStockValue, _InventoryValue, 0)
+
+// Same day rules as [Inventory Movement Status]
+VAR _SlowDays = 31
+VAR _AtRiskDays = 61
+VAR _DeadDays = 90
+// Products within this many days of turning dead
+VAR _SoonDays = 15
+// Approaching means stock is within 20% above the reorder point
+VAR _ApproachBuffer = 1.2
+
+VAR _LastUnitsDate =
+    MAXX(
+        FILTER(ALL(Calendar[Date]), NOT ISBLANK(CALCULATE([Units Sold]))),
+        Calendar[Date]
+    )
+VAR _UnitsStartDate = _LastUnitsDate - 29
+VAR _UnitsSoldLast30Days =
+    CALCULATE(
+        [Units Sold],
+        FILTER(
+            ALL(Calendar[Date]),
+            Calendar[Date] >= _UnitsStartDate && Calendar[Date] <= _LastUnitsDate
+        )
+    )
+VAR _AverageDailyUnits = DIVIDE(_UnitsSoldLast30Days, 30, 0)
+VAR _ForecastUnits7Days = _AverageDailyUnits * 7
+VAR _EstimatedStockCoverDays = DIVIDE([Current Stock Units], _AverageDailyUnits, 0)
+
+VAR _LastRevenueDate =
+    MAXX(
+        FILTER(ALL(Calendar[Date]), NOT ISBLANK(CALCULATE([Revenue]))),
+        Calendar[Date]
+    )
+VAR _TrendBase =
+    TOPN(
+        30,
+        FILTER(
+            ALL(Calendar[Date]),
+            Calendar[Date] <= _LastRevenueDate && NOT ISBLANK(CALCULATE([Revenue]))
+        ),
+        Calendar[Date], DESC
+    )
+VAR _TrendRows = ADDCOLUMNS(_TrendBase, "TrendRevenue", CALCULATE([Revenue]))
+VAR _TrendCount = COUNTROWS(_TrendRows)
+VAR _AverageDailyRevenue = AVERAGEX(_TrendRows, [TrendRevenue])
+VAR _RevenueForecastText =
+    IF(_TrendCount > 0, FORMAT(_AverageDailyRevenue * 7, _CurrencyFormat), "N/A")
+
+VAR _DailyRev =
+    FILTER(
+        ADDCOLUMNS(ALL(Calendar[Date]), "r", CALCULATE([Revenue])),
+        NOT ISBLANK([r])
+    )
+VAR _DailyData =
+    CONCATENATEX(
+        _DailyRev,
+        FORMAT(Calendar[Date], "yyyy-mm-dd") & ":" & FORMAT([r], "0"),
+        ",",
+        Calendar[Date], ASC
+    )
+
+VAR _P1 =
+    ADDCOLUMNS(
+        VALUES(Products[ProductID]),
+        "pName", COALESCE(CALCULATE(SELECTEDVALUE(Products[ProductName])), ""),
+        "pCat", COALESCE(CALCULATE(SELECTEDVALUE(Products[Category])), "No category"),
+        "pStock", COALESCE([Current Stock Units], 0),
+        "pCost", COALESCE(CALCULATE(MAX(Products[UnitCost])), 0),
+        "pROP", COALESCE(CALCULATE(MAX(Products[ReorderPoint])), 0),
+        "pLast", [Last Sale Date],
+        "pDays", [Days Since Last Sale],
+        "pUnits30",
+            COALESCE(
+                CALCULATE(
+                    [Units Sold],
+                    FILTER(
+                        ALL(Calendar[Date]),
+                        Calendar[Date] >= _UnitsStartDate && Calendar[Date] <= _LastUnitsDate
+                    )
+                ),
+                0
+            )
+    )
+
+VAR _P2 =
+    ADDCOLUMNS(
+        FILTER(_P1, [pName] <> ""),
+        "pValue", [pStock] * [pCost],
+        "pDaily", DIVIDE([pUnits30], 30, 0),
+        "pSafe", SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE([pName], "&", "&amp;"), "'", "&#39;"), "<", "&lt;"), ">", "&gt;"),
+        "pCatSafe", SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE([pCat], "&", "&amp;"), "'", "&#39;"), "<", "&lt;"), ">", "&gt;"),
+        "pStatus",
+            SWITCH(
+                TRUE(),
+                [pStock] <= 0, "No Stock",
+                ISBLANK([pLast]), "No Sales",
+                [pDays] >= _DeadDays, "Dead Stock",
+                [pDays] >= _AtRiskDays, "At Risk",
+                [pDays] >= _SlowDays, "Slow Moving",
+                "Healthy"
+            )
+    )
+
+VAR _P3 =
+    ADDCOLUMNS(
+        _P2,
+        "pKey",
+            SWITCH(
+                [pStatus],
+                "Dead Stock", "dead-stock",
+                "At Risk", "at-risk",
+                "Slow Moving", "slow-moving",
+                "No Stock", "no-stock",
+                "No Sales", "no-sales",
+                "healthy"
+            ),
+        "pCover", IF([pDaily] > 0, DIVIDE([pStock], [pDaily]), BLANK()),
+        "pRep",
+            IF(
+                [pStock] <= 0, "out",
+                IF(
+                    [pROP] > 0 && [pStock] <= [pROP], "below",
+                    IF([pROP] > 0 && [pStock] <= [pROP] * _ApproachBuffer, "approaching", "ok")
+                )
+            ),
+        "pShort", MAX(0, [pROP] - [pStock])
+    )
+
+VAR _P =
+    ADDCOLUMNS(
+        _P3,
+        "pBuy", [pShort] * [pCost],
+        "pRank", SWITCH([pRep], "out", 1, "below", 2, "approaching", 3, 9),
+        "pRepLbl", SWITCH([pRep], "out", "Out of stock", "below", "Below reorder point", "approaching", "Approaching reorder point", ""),
+        "pDaysTxt", IF(ISBLANK([pDays]), "No sales", FORMAT([pDays], "#,##0") & " days ago"),
+        "pRowHtml",
+            "<tr class='product-row' data-name='" & [pSafe] & "' data-status='" & [pStatus] & "' data-status-key='" & [pKey] & "'>
+                <td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+                <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+                <td class='number'>" & FORMAT([pCost], _CurrencyFormat) & "</td>
+                <td class='number value'>" & FORMAT([pValue], _CurrencyFormat) & "</td>
+                <td><span class='status s-" & [pKey] & "'>" & [pStatus] & "</span></td>
+            </tr>"
+    )
+
+VAR _ProdCount = COUNTROWS(_P)
+VAR _TotalUnits = SUMX(_P, [pStock])
+VAR _SumValue = SUMX(_P, [pValue])
+VAR _CntHealthy = COUNTROWS(FILTER(_P, [pKey] = "healthy"))
+VAR _CntSlow = COUNTROWS(FILTER(_P, [pKey] = "slow-moving"))
+VAR _CntRisk = COUNTROWS(FILTER(_P, [pKey] = "at-risk"))
+VAR _DeadRowsTbl = FILTER(_P, [pKey] = "dead-stock")
+VAR _CntDead = COUNTROWS(_DeadRowsTbl)
+VAR _CntOther = _ProdCount - _CntHealthy - _CntSlow - _CntRisk - _CntDead
+VAR _ValHealthy = SUMX(FILTER(_P, [pKey] = "healthy"), [pValue])
+VAR _ValSlow = SUMX(FILTER(_P, [pKey] = "slow-moving"), [pValue])
+VAR _ValRisk = SUMX(FILTER(_P, [pKey] = "at-risk"), [pValue])
+VAR _ValDeadTbl = SUMX(_DeadRowsTbl, [pValue])
+VAR _ValOther = _SumValue - _ValHealthy - _ValSlow - _ValRisk - _ValDeadTbl
+VAR _HealthyPct = DIVIDE(_ValHealthy, _SumValue, 0)
+VAR _StuckPct = DIVIDE(_ValSlow + _ValRisk + _ValDeadTbl, _SumValue, 0)
+VAR _SlowRiskCnt = _CntSlow + _CntRisk
+VAR _SlowRiskVal = _ValSlow + _ValRisk
+VAR _SlowRiskRows = FILTER(_P, [pKey] = "slow-moving" || [pKey] = "at-risk")
+VAR _SoonRows = FILTER(_P, [pKey] = "at-risk" && [pDays] >= _DeadDays - _SoonDays)
+VAR _SoonCnt = COUNTROWS(_SoonRows)
+VAR _SoonVal = SUMX(_SoonRows, [pValue])
+VAR _MaxDeadDays = MAXX(_DeadRowsTbl, [pDays])
+VAR _Top5Rows = TOPN(5, _P, [pValue], DESC)
+VAR _Top5Share = DIVIDE(SUMX(_Top5Rows, [pValue]), _SumValue, 0)
+
+VAR _CatList = DISTINCT(SELECTCOLUMNS(_P, "cname", [pCatSafe]))
+VAR _CatCalc =
+    ADDCOLUMNS(
+        _CatList,
+        "cv", VAR _c = [cname] RETURN SUMX(FILTER(_P, [pCatSafe] = _c), [pValue]),
+        "cd", VAR _c2 = [cname] RETURN SUMX(FILTER(_P, [pCatSafe] = _c2 && [pKey] = "dead-stock"), [pValue]),
+        "cn", VAR _c3 = [cname] RETURN COUNTROWS(FILTER(_P, [pCatSafe] = _c3))
+    )
+VAR _CatTop = TOPN(6, _CatCalc, [cv], DESC)
+VAR _CatMax = MAXX(_CatTop, [cv])
+VAR _CatCount = COUNTROWS(_CatList)
+VAR _CatTop1 = TOPN(1, _CatCalc, [cv], DESC)
+VAR _TopCatName = MAXX(_CatTop1, [cname])
+VAR _TopCatShare = DIVIDE(MAXX(_CatTop1, [cv]), _SumValue, 0)
+VAR _TopDeadCat = MAXX(TOPN(1, _CatCalc, [cd], DESC), [cname])
+
+VAR _D1 = FILTER(_DeadRowsTbl, [pDays] < 120)
+VAR _D2 = FILTER(_DeadRowsTbl, [pDays] >= 120 && [pDays] < 180)
+VAR _D3 = FILTER(_DeadRowsTbl, [pDays] >= 180 && [pDays] < 365)
+VAR _D4 = FILTER(_DeadRowsTbl, [pDays] >= 365)
+VAR _DeadAging =
+    UNION(
+        ROW("ord", 1, "lbl", "90 to 119 days", "cv", SUMX(_D1, [pValue]), "cn", COUNTROWS(_D1), "cls", "s-at-risk"),
+        ROW("ord", 2, "lbl", "120 to 179 days", "cv", SUMX(_D2, [pValue]), "cn", COUNTROWS(_D2), "cls", "s-at-risk"),
+        ROW("ord", 3, "lbl", "180 to 364 days", "cv", SUMX(_D3, [pValue]), "cn", COUNTROWS(_D3), "cls", "s-dead-stock"),
+        ROW("ord", 4, "lbl", "A year or more", "cv", SUMX(_D4, [pValue]), "cn", COUNTROWS(_D4), "cls", "s-dead-stock")
+    )
+VAR _AgeMax = MAXX(_DeadAging, [cv])
+VAR _YearPlusVal = SUMX(_D4, [pValue])
+
+VAR _NeedAll = FILTER(_P, [pRep] <> "ok")
+VAR _NeedNow = FILTER(_NeedAll, NOT ISBLANK([pLast]) && [pDays] < _DeadDays)
+VAR _NeedReview = FILTER(_NeedAll, ISBLANK([pLast]) || [pDays] >= _DeadDays)
+VAR _NeedAllCnt = COUNTROWS(_NeedAll)
+VAR _NeedNowCnt = COUNTROWS(_NeedNow)
+VAR _NeedReviewCnt = COUNTROWS(_NeedReview)
+VAR _CntOut = COUNTROWS(FILTER(_P, [pRep] = "out"))
+VAR _OutRecent = COUNTROWS(FILTER(_NeedNow, [pRep] = "out"))
+VAR _CntBelow = COUNTROWS(FILTER(_P, [pRep] = "below"))
+VAR _CntApproach = COUNTROWS(FILTER(_P, [pRep] = "approaching"))
+VAR _NeedCost = SUMX(_NeedNow, [pBuy])
+VAR _NeedNames =
+    CONCATENATEX(TOPN(3, _NeedNow, [pRank], ASC, [pDaily], DESC), [pSafe], ", ", [pRank], ASC, [pDaily], DESC)
+VAR _HoldRows = FILTER(_P, [pKey] = "dead-stock" || [pKey] = "at-risk" || [pKey] = "slow-moving")
+VAR _HoldCnt = COUNTROWS(_HoldRows)
+VAR _HoldValue = _ValDeadTbl + _ValSlow + _ValRisk
+VAR _HoldNames = CONCATENATEX(TOPN(3, _HoldRows, [pValue], DESC), [pSafe], ", ", [pValue], DESC)
+VAR _HalfDead = _DeadStockValue / 2
+
+VAR _ProductRows = CONCATENATEX(_P, [pRowHtml], "", [pValue], DESC, [pSafe], ASC)
+
+VAR _Top5Html =
+    CONCATENATEX(
+        _Top5Rows,
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number value'>" & FORMAT([pValue], _CurrencyFormat) & "</td>
+         <td class='number'>" & FORMAT(DIVIDE([pValue], _SumValue, 0), "0.0%") & "</td>
+         <td><span class='status s-" & [pKey] & "'>" & [pStatus] & "</span></td></tr>",
+        "", [pValue], DESC
+    )
+
+VAR _CatBars =
+    CONCATENATEX(
+        _CatTop,
+        "<div class='bar-row'><div class='bar-name'>" & [cname] & "</div>
+         <div class='bar-track'><div class='bar-fill' style='width:" & FORMAT(DIVIDE([cv], _CatMax, 0) * 100, "0.0") & "%'>
+         <div class='bar-dead' style='width:" & FORMAT(DIVIDE([cd], [cv], 0) * 100, "0.0") & "%'></div></div></div>
+         <div class='bar-val'>" & FORMAT([cv], _CurrencyFormat) & "<small>" & FORMAT(DIVIDE([cv], _SumValue, 0), "0%") & " of inventory</small></div></div>",
+        "", [cv], DESC
+    )
+
+VAR _AgingBars =
+    CONCATENATEX(
+        _DeadAging,
+        "<div class='bar-row'><div class='bar-name'>" & [lbl] & "</div>
+         <div class='bar-track'><div class='bar-fill tint " & [cls] & "' style='width:" & FORMAT(DIVIDE([cv], _AgeMax, 0) * 100, "0.0") & "%'></div></div>
+         <div class='bar-val'>" & FORMAT([cv], _CurrencyFormat) & "<small>" & FORMAT([cn], "#,##0") & " products</small></div></div>",
+        "", [ord], ASC
+    )
+
+VAR _LadderMax = MAX(_ValSlow, MAX(_ValRisk, _ValDeadTbl))
+VAR _Ladder =
+    "<div class='bar-row'><div class='bar-name'>Slow Moving</div><div class='bar-track'><div class='bar-fill tint s-slow-moving' style='width:" & FORMAT(DIVIDE(_ValSlow, _LadderMax, 0) * 100, "0.0") & "%'></div></div><div class='bar-val'>" & FORMAT(_ValSlow, _CurrencyFormat) & "<small>" & FORMAT(_CntSlow, "#,##0") & " products</small></div></div>" &
+    "<div class='bar-row'><div class='bar-name'>At Risk</div><div class='bar-track'><div class='bar-fill tint s-at-risk' style='width:" & FORMAT(DIVIDE(_ValRisk, _LadderMax, 0) * 100, "0.0") & "%'></div></div><div class='bar-val'>" & FORMAT(_ValRisk, _CurrencyFormat) & "<small>" & FORMAT(_CntRisk, "#,##0") & " products</small></div></div>" &
+    "<div class='bar-row'><div class='bar-name'>Dead Stock</div><div class='bar-track'><div class='bar-fill tint s-dead-stock' style='width:" & FORMAT(DIVIDE(_ValDeadTbl, _LadderMax, 0) * 100, "0.0") & "%'></div></div><div class='bar-val'>" & FORMAT(_ValDeadTbl, _CurrencyFormat) & "<small>" & FORMAT(_CntDead, "#,##0") & " products</small></div></div>"
+
+VAR _MixBar =
+    "<div class='mixbar'>
+        <div class='seg s-healthy' style='width:" & FORMAT(DIVIDE(_ValHealthy, _SumValue, 0) * 100, "0.0") & "%'></div>
+        <div class='seg s-slow-moving' style='width:" & FORMAT(DIVIDE(_ValSlow, _SumValue, 0) * 100, "0.0") & "%'></div>
+        <div class='seg s-at-risk' style='width:" & FORMAT(DIVIDE(_ValRisk, _SumValue, 0) * 100, "0.0") & "%'></div>
+        <div class='seg s-dead-stock' style='width:" & FORMAT(DIVIDE(_ValDeadTbl, _SumValue, 0) * 100, "0.0") & "%'></div>
+        <div class='seg s-other' style='width:" & FORMAT(DIVIDE(_ValOther, _SumValue, 0) * 100, "0.0") & "%'></div>
+     </div>"
+
+VAR _MixLegend =
+    "<div class='legend-row'><span class='dot s-healthy'></span><span>Healthy: sold in the last " & (_SlowDays - 1) & " days</span><span class='legend-n'>" & FORMAT(_CntHealthy, "#,##0") & " products</span><span class='legend-v'>" & FORMAT(_ValHealthy, _CurrencyFormat) & "</span><span class='legend-p'>" & FORMAT(DIVIDE(_ValHealthy, _SumValue, 0), "0%") & "</span></div>" &
+    "<div class='legend-row'><span class='dot s-slow-moving'></span><span>Slow Moving: last sale " & _SlowDays & " to " & (_AtRiskDays - 1) - 0 & " days ago</span><span class='legend-n'>" & FORMAT(_CntSlow, "#,##0") & " products</span><span class='legend-v'>" & FORMAT(_ValSlow, _CurrencyFormat) & "</span><span class='legend-p'>" & FORMAT(DIVIDE(_ValSlow, _SumValue, 0), "0%") & "</span></div>" &
+    "<div class='legend-row'><span class='dot s-at-risk'></span><span>At Risk: last sale " & _AtRiskDays & " to " & (_DeadDays - 1) & " days ago</span><span class='legend-n'>" & FORMAT(_CntRisk, "#,##0") & " products</span><span class='legend-v'>" & FORMAT(_ValRisk, _CurrencyFormat) & "</span><span class='legend-p'>" & FORMAT(DIVIDE(_ValRisk, _SumValue, 0), "0%") & "</span></div>" &
+    "<div class='legend-row'><span class='dot s-dead-stock'></span><span>Dead Stock: no sale in " & _DeadDays & " days or more</span><span class='legend-n'>" & FORMAT(_CntDead, "#,##0") & " products</span><span class='legend-v'>" & FORMAT(_ValDeadTbl, _CurrencyFormat) & "</span><span class='legend-p'>" & FORMAT(DIVIDE(_ValDeadTbl, _SumValue, 0), "0%") & "</span></div>" &
+    "<div class='legend-row'><span class='dot s-other'></span><span>Out of stock or no sales on record</span><span class='legend-n'>" & FORMAT(_CntOther, "#,##0") & " products</span><span class='legend-v'>" & FORMAT(_ValOther, _CurrencyFormat) & "</span><span class='legend-p'>" & FORMAT(DIVIDE(_ValOther, _SumValue, 0), "0%") & "</span></div>"
+
+VAR _DeadRows =
+    CONCATENATEX(
+        TOPN(25, _DeadRowsTbl, [pValue], DESC),
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number'>" & FORMAT([pDays], "#,##0") & " days</td>
+         <td class='number value'>" & FORMAT([pValue], _CurrencyFormat) & "</td>
+         <td class='number'>" & FORMAT(DIVIDE([pValue], _ValDeadTbl, 0), "0.0%") & "</td></tr>",
+        "", [pValue], DESC
+    )
+
+VAR _SlowRiskTableRows =
+    CONCATENATEX(
+        TOPN(15, _SlowRiskRows, [pDays], DESC),
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number'>" & FORMAT([pDays], "#,##0") & " days</td>
+         <td class='number value'>" & FORMAT([pValue], _CurrencyFormat) & "</td>
+         <td><span class='status s-" & [pKey] & "'>" & [pStatus] & "</span></td></tr>",
+        "", [pDays], DESC
+    )
+
+VAR _NeedTableRows =
+    CONCATENATEX(
+        TOPN(15, _NeedNow, [pRank], ASC, [pDaily], DESC),
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number'>" & FORMAT([pROP], "#,##0") & "</td>
+         <td class='number'>" & [pDaysTxt] & "</td>
+         <td class='number'>" & FORMAT([pShort], "#,##0") & "</td>
+         <td class='number value'>" & FORMAT([pBuy], _CurrencyFormat) & "</td>
+         <td><span class='status " & SWITCH([pRep], "out", "s-no-stock", "below", "s-at-risk", "s-slow-moving") & "'>" & [pRepLbl] & "</span></td></tr>",
+        "", [pRank], ASC, [pDaily], DESC
+    )
+
+VAR _ReviewRows =
+    CONCATENATEX(
+        TOPN(6, _NeedReview, [pROP], DESC),
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number'>" & FORMAT([pROP], "#,##0") & "</td>
+         <td class='number'>" & [pDaysTxt] & "</td>
+         <td><span class='status s-" & [pKey] & "'>" & [pStatus] & "</span></td></tr>",
+        "", [pROP], DESC
+    )
+
+VAR _HoldTableRows =
+    CONCATENATEX(
+        TOPN(8, _HoldRows, [pValue], DESC),
+        "<tr><td><div class='product-name'>" & [pSafe] & "</div><div class='product-category'>" & [pCatSafe] & "</div></td>
+         <td class='number'>" & FORMAT([pStock], "#,##0") & "</td>
+         <td class='number'>" & [pDaysTxt] & "</td>
+         <td class='number value'>" & FORMAT([pValue], _CurrencyFormat) & "</td>
+         <td><span class='status s-" & [pKey] & "'>" & [pStatus] & "</span></td></tr>",
+        "", [pValue], DESC
+    )
+
+VAR _LstValue = CONCATENATEX(TOPN(5, _P, [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstUnits = CONCATENATEX(TOPN(5, _P, [pStock], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pStock], "#,##0") & " units</b></div>", "", [pStock], DESC)
+VAR _LstCats = CONCATENATEX(TOPN(5, _CatCalc, [cn], DESC), "<div class='mini-row'><span>" & [cname] & "</span><b>" & FORMAT([cn], "#,##0") & " products</b></div>", "", [cn], DESC)
+VAR _LstHealthy = CONCATENATEX(TOPN(5, FILTER(_P, [pKey] = "healthy"), [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstDead = CONCATENATEX(TOPN(5, _DeadRowsTbl, [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstDeadCat = CONCATENATEX(TOPN(5, FILTER(_CatCalc, [cd] > 0), [cd], DESC), "<div class='mini-row'><span>" & [cname] & "</span><b>" & FORMAT([cd], _CurrencyFormat) & "</b></div>", "", [cd], DESC)
+VAR _LstDeadUnits = CONCATENATEX(TOPN(5, _DeadRowsTbl, [pStock], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pStock], "#,##0") & " units</b></div>", "", [pStock], DESC)
+VAR _LstOldest = CONCATENATEX(TOPN(5, _DeadRowsTbl, [pDays], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pDays], "#,##0") & " days</b></div>", "", [pDays], DESC)
+VAR _LstSlow = CONCATENATEX(TOPN(5, FILTER(_P, [pKey] = "slow-moving"), [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstRisk = CONCATENATEX(TOPN(5, FILTER(_P, [pKey] = "at-risk"), [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstSlowRisk = CONCATENATEX(TOPN(5, _SlowRiskRows, [pValue], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pValue], _CurrencyFormat) & "</b></div>", "", [pValue], DESC)
+VAR _LstSoon = CONCATENATEX(TOPN(5, _SoonRows, [pDays], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pDays], "#,##0") & " days</b></div>", "", [pDays], DESC)
+VAR _LstNeed = CONCATENATEX(TOPN(5, _NeedNow, [pRank], ASC, [pDaily], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & [pRepLbl] & "</b></div>", "", [pRank], ASC, [pDaily], DESC)
+VAR _LstOOS = CONCATENATEX(TOPN(5, FILTER(_P, [pRep] = "out" && NOT ISBLANK([pLast])), [pDays], ASC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>Last sold " & [pDaysTxt] & "</b></div>", "", [pDays], ASC)
+VAR _LstBelow = CONCATENATEX(TOPN(5, FILTER(_P, [pRep] = "below"), [pDaily], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pStock], "#,##0") & " left, reorder at " & FORMAT([pROP], "#,##0") & "</b></div>", "", [pDaily], DESC)
+VAR _LstApproach = CONCATENATEX(TOPN(5, FILTER(_P, [pRep] = "approaching"), [pDaily], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pStock], "#,##0") & " left, reorder at " & FORMAT([pROP], "#,##0") & "</b></div>", "", [pDaily], DESC)
+VAR _LstCost = CONCATENATEX(TOPN(5, _NeedNow, [pBuy], DESC), "<div class='mini-row'><span>" & [pSafe] & "</span><b>" & FORMAT([pBuy], _CurrencyFormat) & "</b></div>", "", [pBuy], DESC)
+
+VAR _LeadOverview =
+    "Your inventory is worth <b>" & FORMAT(_InventoryValue, _CurrencyFormat) & "</b>. <b>" & FORMAT(_DeadStockPct, "0%") & "</b> of it is dead stock, and <b>" & FORMAT(_NeedAllCnt, "#,##0") & "</b> " & IF(_NeedAllCnt = 1, "product needs", "products need") & " replenishment."
+VAR _LeadC1 =
+    "You hold <b>" & FORMAT(_InventoryValue, _CurrencyFormat) & "</b> across <b>" & FORMAT(_ProdCount, "#,##0") & "</b> products and <b>" & FORMAT(_TotalUnits, "#,##0") & "</b> units. <b>" & _TopCatName & "</b> holds the most, at " & FORMAT(_TopCatShare, "0%") & " of the value."
+VAR _LeadC2 =
+    "<b>" & FORMAT(_DeadStockValue, _CurrencyFormat) & "</b> (" & FORMAT(_DeadStockPct, "0%") & " of inventory) is tied up in <b>" & FORMAT(_CntDead, "#,##0") & "</b> " & IF(_CntDead = 1, "product", "products") & " that have not sold in " & _DeadDays & " days or more."
+VAR _LeadC3 =
+    "<b>" & FORMAT(_SlowRiskCnt, "#,##0") & "</b> " & IF(_SlowRiskCnt = 1, "product is", "products are") & " slow moving or at risk, with <b>" & FORMAT(_SlowRiskVal, _CurrencyFormat) & "</b> of stock at stake. <b>" & FORMAT(_SoonCnt, "#,##0") & "</b> could turn dead within " & _SoonDays & " days."
+VAR _LeadC4 =
+    "<b>" & FORMAT(_NeedNowCnt, "#,##0") & "</b> " & IF(_NeedNowCnt = 1, "product is", "products are") & " out of stock or running low and still selling. Restoring them to their reorder point costs about <b>" & FORMAT(_NeedCost, _CurrencyFormat) & "</b>."
+
+VAR _TopActions =
+    "<div class='top-actions'>
+        <div class='icon-button control' role='button' tabindex='0' data-action='theme'>◐ &nbsp; Switch theme</div>
+        <div class='icon-button control' role='button' tabindex='0' data-action='home'>⌂ &nbsp; Home</div>
+     </div>"
+
+VAR _CSS =
+"<style>
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700;800&display=swap');
+html,body{margin:0;padding:0;height:100%;background:#0E1A24;}
+#checkmystocks{--sky:#38BDF8;--kraft:#C9A27A;--bg:#0E1A24;--text:#EEF3F7;--text2:#B4C2CE;--text3:#8296A6;--card:rgba(255,255,255,.06);--cardline:rgba(255,255,255,.12);--accent:#7DD3FC;--sidebar:rgba(6,14,22,.7);--input:#16283A;--thead:rgba(255,255,255,.04);--line:rgba(255,255,255,.11);position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:'Manrope',Arial,sans-serif;isolation:isolate;box-sizing:border-box;}
+#checkmystocks.light-mode{--sky:#0EA5E9;--kraft:#A67C52;--bg:#EEF4F8;--text:#12202C;--text2:#4B5E6E;--text3:#64788A;--card:rgba(255,255,255,.95);--cardline:rgba(15,40,60,.12);--accent:#0369A1;--sidebar:#E2EAF0;--input:#FFFFFF;--thead:#E7EEF3;--line:rgba(15,40,60,.1);}
+#checkmystocks *{box-sizing:border-box;}
+#checkmystocks h1,#checkmystocks h2,#checkmystocks h3,#checkmystocks .metric-value,#checkmystocks .hero-name,#checkmystocks .lead-title,#checkmystocks .action-big{font-family:'Sora',Arial,sans-serif;}
+#checkmystocks [role=button]{cursor:pointer;}
+#checkmystocks [role=button]:focus-visible,#checkmystocks input:focus-visible,#checkmystocks select:focus-visible{outline:2px solid var(--sky);outline-offset:3px;}
+#checkmystocks .control{display:inline-flex;align-items:center;justify-content:center;gap:11px;cursor:pointer;user-select:none;transition:transform .25s ease,background .25s ease,box-shadow .25s ease,border-color .25s ease,color .25s ease;}
+#checkmystocks .control:active{transform:scale(.97);}
+#checkmystocks .primary-control{padding:15px 22px;border-radius:11px;color:#06263A;font-weight:800;font-size:13px;background:linear-gradient(130deg,#BAE6FD,#38BDF8);border:1px solid rgba(255,255,255,.35);box-shadow:0 9px 28px rgba(56,189,248,.24),inset 0 1px 0 rgba(255,255,255,.5);}
+#checkmystocks .primary-control:hover{transform:translateY(-4px);box-shadow:0 16px 38px rgba(56,189,248,.35),inset 0 1px 0 rgba(255,255,255,.5);}
+#checkmystocks .glass{border:1px solid var(--cardline);background:var(--card);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:0 14px 38px rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.08);}
+#checkmystocks .s-healthy{--c:#5FD3A0;--cb:rgba(95,211,160,.15);}
+#checkmystocks .s-slow-moving{--c:#F4C95D;--cb:rgba(244,201,93,.15);}
+#checkmystocks .s-at-risk{--c:#FB923C;--cb:rgba(251,146,60,.15);}
+#checkmystocks .s-dead-stock,#checkmystocks .s-no-stock{--c:#F26B6B;--cb:rgba(242,107,107,.15);}
+#checkmystocks .s-no-sales,#checkmystocks .s-other{--c:#9FB1C0;--cb:rgba(159,177,192,.14);}
+#checkmystocks .status{display:inline-block;border-radius:30px;padding:6px 11px;font-size:10px;font-weight:700;white-space:nowrap;color:var(--c);background:var(--cb);}
+#checkmystocks.light-mode .status{filter:brightness(.62) saturate(1.3);}
+#checkmystocks .dot{width:10px;height:10px;border-radius:50%;background:var(--c);}
+#checkmystocks .seg{height:100%;background:var(--c);}
+
+#checkmystocks .landing{position:absolute;inset:0;overflow:auto;isolation:isolate;background:radial-gradient(ellipse at 78% 18%,rgba(56,189,248,.18),transparent 36%),radial-gradient(ellipse at 12% 10%,rgba(201,162,122,.14),transparent 42%),linear-gradient(135deg,#08131C,#0E1E2B 50%,#0A1822);color:#EEF3F7;scrollbar-width:thin;}
+#checkmystocks .landing .glass{background:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.035));border-color:rgba(255,255,255,.15);}
+#checkmystocks .landing:before{content:'';position:absolute;inset:0;opacity:.15;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px);background-size:55px 55px;mask-image:linear-gradient(to bottom,black,transparent 90%);}
+#checkmystocks .landing-glow{position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(100px);opacity:.18;pointer-events:none;animation:glowDrift 14s ease-in-out infinite alternate;}
+#checkmystocks .glow-one{background:#38BDF8;top:-220px;left:-120px;}
+#checkmystocks .glow-two{background:#C9A27A;top:500px;right:-220px;animation-delay:-6s;}
+#checkmystocks .landing-inner{width:min(1500px,94%);min-height:100%;margin:0 auto;display:grid;grid-template-columns:1.02fr 1fr;align-items:center;gap:2%;position:relative;z-index:2;padding:45px 3%;}
+#checkmystocks .hero-copy{padding-left:2%;animation:heroEnter .9s ease both;}
+#checkmystocks .hero-overline{display:flex;align-items:center;gap:12px;color:#7DD3FC;font-size:11px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:26px;}
+#checkmystocks .hero-overline:before{content:'';width:38px;height:1px;background:#38BDF8;}
+#checkmystocks .hero-name{font-size:clamp(56px,7vw,108px);font-weight:800;letter-spacing:-5px;line-height:.96;margin:0;color:#EEF3F7;}
+#checkmystocks .hero-name span{color:#7DD3FC;}
+#checkmystocks .hero-tagline{color:#D9BF9D;font-family:Georgia,serif;font-size:clamp(18px,2vw,25px);font-style:italic;margin-top:21px;}
+#checkmystocks .hero-description{max-width:520px;color:#B4C2CE;font-size:14px;line-height:1.9;margin:28px 0 32px;}
+#checkmystocks .hero-actions{display:flex;align-items:center;flex-wrap:wrap;gap:20px;}
+#checkmystocks .hero-caption{color:#8296A6;font-size:11px;letter-spacing:.5px;}
+#checkmystocks .hero-art{position:relative;height:min(690px,85%);min-height:480px;display:flex;align-items:center;justify-content:center;perspective:1100px;animation:artEnter 1.1s .15s ease both;}
+#checkmystocks .glass-orbit{position:absolute;width:min(90%,570px);aspect-ratio:1;border:1px solid rgba(125,211,252,.2);border-radius:50%;transform:rotateX(65deg) rotateZ(-25deg);animation:orbitSpin 35s linear infinite;}
+#checkmystocks .glass-orbit:before,#checkmystocks .glass-orbit:after{content:'';position:absolute;inset:12%;border:1px solid rgba(125,211,252,.17);border-radius:50%;}
+#checkmystocks .glass-orbit:after{inset:27%;}
+#checkmystocks .glass-platform{position:absolute;width:74%;height:23%;bottom:15%;border-radius:50%;transform:rotateX(68deg);background:linear-gradient(90deg,transparent,rgba(56,189,248,.2),transparent);border:1px solid rgba(125,211,252,.24);}
+#checkmystocks .inventory-cube{position:absolute;width:170px;height:170px;border-radius:25px;border:1px solid rgba(255,255,255,.3);background:linear-gradient(135deg,rgba(255,255,255,.22),rgba(255,255,255,.035));backdrop-filter:blur(20px);box-shadow:18px 25px 55px rgba(0,0,0,.32),inset 1px 1px 0 rgba(255,255,255,.3);display:flex;align-items:center;justify-content:center;animation:cubeFloat 7s ease-in-out infinite;}
+#checkmystocks .cube-main{width:190px;height:190px;z-index:3;}
+#checkmystocks .cube-inner{width:65%;height:65%;border:1px solid rgba(125,211,252,.65);border-radius:18px;background:linear-gradient(145deg,rgba(56,189,248,.23),rgba(255,255,255,.015));display:grid;place-items:center;color:#7DD3FC;font-size:48px;}
+#checkmystocks .cube-main .cube-inner{border-color:rgba(224,190,152,.7);background:linear-gradient(145deg,rgba(201,162,122,.28),rgba(255,255,255,.015));color:#E0BE98;}
+#checkmystocks .cube-small{width:105px;height:105px;border-radius:19px;}
+#checkmystocks .cube-small .cube-inner{font-size:27px;border-radius:12px;}
+#checkmystocks .cube-left{left:8%;top:26%;transform:rotate(14deg);}
+#checkmystocks .cube-right{right:6%;bottom:25%;transform:rotate(-19deg);animation-delay:-4s;}
+#checkmystocks .floating-glass-card{position:absolute;z-index:4;min-width:190px;padding:16px 18px;border-radius:15px;animation:cardFloat 6s ease-in-out infinite;}
+#checkmystocks .float-card-one{top:15%;right:0;}
+#checkmystocks .float-card-two{bottom:13%;left:0;animation-delay:-3s;}
+#checkmystocks .float-label{color:#B4C2CE;font-size:10px;letter-spacing:1px;text-transform:uppercase;}
+#checkmystocks .float-value{color:#E6F6FE;font-size:20px;font-weight:800;margin-top:7px;}
+#checkmystocks .float-note{color:#8296A6;font-size:10px;margin-top:4px;}
+#checkmystocks .spark{position:absolute;width:5px;height:5px;background:#7DD3FC;border-radius:50%;box-shadow:0 0 14px 4px rgba(125,211,252,.35);animation:sparkle 3s ease-in-out infinite;}
+#checkmystocks .spark-a{top:18%;left:30%;}
+#checkmystocks .spark-b{top:65%;right:12%;animation-delay:-1s;}
+#checkmystocks .spark-c{bottom:20%;left:25%;animation-delay:-2s;}
+#checkmystocks .landing-story{position:relative;z-index:2;width:min(1320px,90%);margin:auto;padding:70px 0 80px;}
+#checkmystocks .story-kicker{color:#7DD3FC;font-size:10px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:16px;}
+#checkmystocks .story-heading{max-width:760px;margin-bottom:38px;}
+#checkmystocks .story-heading h2{color:#EEF3F7;font-size:clamp(28px,3.6vw,48px);line-height:1.15;letter-spacing:-1.5px;margin:0;}
+#checkmystocks .story-heading p{color:#B4C2CE;font-size:14px;line-height:1.85;max-width:650px;margin-top:20px;}
+#checkmystocks .story-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;}
+#checkmystocks .story-card{min-height:210px;padding:24px;border-radius:17px;transition:transform .3s,border-color .3s;}
+#checkmystocks .story-card:hover{transform:translateY(-8px);border-color:rgba(125,211,252,.5);}
+#checkmystocks .story-card-number{color:#C9A27A;font-family:Georgia,serif;font-size:27px;margin-bottom:20px;}
+#checkmystocks .story-card h3{color:#F3F7FA;font-size:16px;margin:0 0 12px;line-height:1.35;}
+#checkmystocks .story-card p{color:#B4C2CE;font-size:12px;line-height:1.8;margin:0;}
+#checkmystocks .landing-cta{position:relative;z-index:2;width:min(1320px,90%);margin:0 auto 55px;padding:44px 30px;text-align:center;border-radius:22px;}
+#checkmystocks .landing-cta h2{color:#F3F7FA;font-size:clamp(25px,3.2vw,40px);margin:0 0 13px;}
+#checkmystocks .landing-cta p{color:#B4C2CE;font-size:13px;margin:0 0 25px;}
+#checkmystocks .landing-footer{position:relative;z-index:2;padding:22px 5%;display:flex;justify-content:space-between;gap:15px;color:#8296A6;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;border-top:1px solid rgba(255,255,255,.09);}
+
+#checkmystocks .workspace{display:none;position:absolute;inset:0;background:radial-gradient(ellipse at 90% 0%,rgba(56,189,248,.1),transparent 40%),var(--bg);}
+#checkmystocks.workspace-open .landing{display:none;}
+#checkmystocks.workspace-open .workspace{display:flex;}
+#checkmystocks .sidebar{width:236px;flex:0 0 236px;height:100%;padding:26px 16px 20px;background:var(--sidebar);border-right:1px solid var(--line);display:flex;flex-direction:column;backdrop-filter:blur(22px);overflow-y:auto;}
+#checkmystocks .brand{display:flex;align-items:center;gap:12px;padding:0 8px 32px;}
+#checkmystocks .brand-mark{width:43px;height:43px;flex:0 0 43px;border-radius:13px;background:linear-gradient(135deg,#BAE6FD,#38BDF8);color:#06263A;display:grid;place-items:center;font-size:23px;font-weight:800;}
+#checkmystocks .brand-name{font-size:16px;font-weight:800;}
+#checkmystocks .brand-sub{color:var(--text3);font-size:9px;letter-spacing:1.6px;margin-top:4px;text-transform:uppercase;}
+#checkmystocks .nav-label{color:var(--text3);font-size:9px;letter-spacing:2px;text-transform:uppercase;padding:0 12px;margin:10px 0 12px;}
+#checkmystocks .nav-item{width:100%;justify-content:flex-start;display:flex;align-items:center;gap:12px;padding:13px;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--text2);text-align:left;font-size:12px;margin-bottom:6px;line-height:1.35;}
+#checkmystocks .nav-item:hover,#checkmystocks .nav-item.active{color:var(--accent);border-color:rgba(56,189,248,.25);background:linear-gradient(100deg,rgba(56,189,248,.16),rgba(56,189,248,.03));box-shadow:inset 3px 0 0 var(--sky);}
+#checkmystocks .nav-icon{width:24px;flex:0 0 24px;font-size:15px;text-align:center;font-family:Georgia,serif;}
+#checkmystocks .sidebar-bottom{margin-top:auto;border-top:1px solid var(--line);padding:18px 8px 0;}
+#checkmystocks .system-status{color:var(--text2);font-size:10px;display:flex;align-items:center;gap:9px;}
+#checkmystocks .status-dot{width:8px;height:8px;border-radius:50%;background:#5FD3A0;box-shadow:0 0 12px #5FD3A0;}
+#checkmystocks .main{flex:1;min-width:0;height:100%;overflow-y:auto;padding:28px 34px 40px;scrollbar-width:thin;scrollbar-color:rgba(56,189,248,.4) transparent;}
+#checkmystocks .topbar{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:22px;}
+#checkmystocks .eyebrow{color:var(--accent);text-transform:uppercase;letter-spacing:2px;font-size:10px;font-weight:800;margin-bottom:9px;}
+#checkmystocks h1{font-size:clamp(22px,2.1vw,32px);margin:0;font-weight:700;letter-spacing:-1px;line-height:1.2;}
+#checkmystocks .top-actions{display:flex;gap:9px;}
+#checkmystocks .icon-button{border:1px solid var(--line);background:var(--card);color:var(--text2);border-radius:9px;padding:11px 14px;font-size:11px;}
+#checkmystocks .icon-button:hover{border-color:var(--sky);color:var(--accent);transform:translateY(-2px);}
+#checkmystocks .screen{display:none;animation:pageEnter .35s ease both;}
+#checkmystocks .screen.active{display:block;}
+
+#checkmystocks .lead{padding:26px 28px;border-radius:16px;margin-bottom:18px;background:linear-gradient(120deg,rgba(56,189,248,.16),rgba(56,189,248,.03));border:1px solid rgba(56,189,248,.3);}
+#checkmystocks .lead-kicker{color:var(--accent);font-size:10px;font-weight:800;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:12px;}
+#checkmystocks .lead-title{font-size:clamp(17px,1.9vw,24px);line-height:1.45;font-weight:600;letter-spacing:-.3px;margin:0;color:var(--text);}
+#checkmystocks .lead-title b{color:var(--accent);font-weight:800;}
+#checkmystocks .lead-sub{color:var(--text2);font-size:12px;line-height:1.8;margin:14px 0 0;max-width:860px;}
+#checkmystocks .explainer{margin:0 0 16px;padding:11px 15px;border-left:3px solid var(--kraft);background:rgba(201,162,122,.1);border-radius:0 9px 9px 0;color:var(--text2);font-size:12px;line-height:1.7;}
+#checkmystocks .explainer b{color:var(--accent);}
+#checkmystocks .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;}
+#checkmystocks .metric-card{min-height:128px;padding:19px;border-radius:15px;transition:transform .25s,border-color .25s;position:relative;text-align:left;}
+#checkmystocks .metric-card:hover{transform:translateY(-4px);border-color:rgba(125,211,252,.45);}
+#checkmystocks .kpi:after{content:'+';position:absolute;top:13px;right:16px;color:var(--text3);font-size:16px;}
+#checkmystocks .kpi.open{border-color:var(--sky);}
+#checkmystocks .kpi.open:after{content:'×';color:var(--accent);}
+#checkmystocks .metric-label{color:var(--text2);font-size:11px;margin-bottom:14px;padding-right:18px;}
+#checkmystocks .metric-value{font-size:clamp(18px,1.85vw,28px);line-height:1.15;font-weight:700;letter-spacing:-.8px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+#checkmystocks .accent{color:var(--accent);}
+#checkmystocks .metric-note{color:var(--text3);font-size:10px;margin-top:10px;line-height:1.5;}
+#checkmystocks .kpi-detail{display:none;margin-top:14px;padding:18px 20px;border-radius:13px;border:1px solid var(--cardline);background:var(--card);}
+#checkmystocks .kpi-detail.open{display:block;animation:pageEnter .3s ease both;}
+#checkmystocks .kd-note{color:var(--text);font-size:13px;line-height:1.7;margin-bottom:12px;}
+#checkmystocks .kd-note b{color:var(--accent);}
+#checkmystocks .kd-title{color:var(--text3);font-size:9px;letter-spacing:1.6px;text-transform:uppercase;margin-bottom:4px;}
+#checkmystocks .mini-row{display:flex;justify-content:space-between;gap:14px;padding:9px 0;border-top:1px solid var(--line);font-size:12px;color:var(--text2);}
+#checkmystocks .mini-row b{color:var(--text);text-align:right;}
+#checkmystocks .panel{min-width:0;padding:22px;border-radius:15px;margin-top:18px;}
+#checkmystocks .panel-title{font-size:15px;font-weight:800;}
+#checkmystocks .panel-subtitle{color:var(--text3);font-size:11px;margin:7px 0 14px;line-height:1.6;}
+#checkmystocks .two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+#checkmystocks .chart-empty{padding:55px 15px;text-align:center;color:var(--text3);font-size:11px;}
+#checkmystocks .forecast-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}
+#checkmystocks .forecast-item{padding:17px;border-radius:11px;background:rgba(128,150,170,.08);border:1px solid var(--line);}
+#checkmystocks .forecast-label{color:var(--text2);font-size:11px;margin-bottom:12px;}
+#checkmystocks .forecast-value{color:var(--accent);font-family:'Sora',Arial,sans-serif;font-size:clamp(17px,1.8vw,26px);font-weight:700;letter-spacing:-.6px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+#checkmystocks .progress-row{margin:16px 0;}
+#checkmystocks .progress-label{display:flex;justify-content:space-between;gap:10px;color:var(--text2);font-size:12px;margin-bottom:9px;}
+#checkmystocks .progress-label strong{color:var(--accent);}
+#checkmystocks .progress-track{height:8px;border-radius:10px;background:rgba(128,150,170,.2);overflow:hidden;}
+#checkmystocks .progress-fill{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--sky),var(--accent));}
+#checkmystocks .section-heading{margin:24px 0 8px;}
+#checkmystocks .section-heading h2{font-size:16px;margin:0;}
+#checkmystocks .section-heading p{color:var(--text3);font-size:11px;margin:7px 0 0;}
+
+#checkmystocks .rev-controls{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin-bottom:14px;}
+#checkmystocks .chip-group{display:flex;gap:6px;flex-wrap:wrap;}
+#checkmystocks .chip{padding:8px 13px;border:1px solid var(--line);border-radius:20px;font-size:11px;color:var(--text2);user-select:none;transition:background .2s,color .2s;}
+#checkmystocks .chip:hover{border-color:var(--sky);}
+#checkmystocks .chip.on{background:var(--sky);color:#06263A;border-color:var(--sky);font-weight:800;}
+#checkmystocks .rev-sliders{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:10px;}
+#checkmystocks .rev-sliders label{display:block;color:var(--text3);font-size:10px;letter-spacing:1px;text-transform:uppercase;}
+#checkmystocks .rev-sliders b{color:var(--accent);margin-left:6px;letter-spacing:0;text-transform:none;font-size:11px;}
+#checkmystocks .rev-sliders input{width:100%;margin:8px 0 0;accent-color:var(--sky);}
+#checkmystocks .rev-wrap{position:relative;}
+#checkmystocks .rev-chart{width:100%;}
+#checkmystocks .rev-chart svg{display:block;width:100%;height:auto;overflow:visible;}
+#checkmystocks .ln-now{fill:none;stroke:var(--sky);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round;}
+#checkmystocks .ln-prev{fill:none;stroke:var(--kraft);stroke-width:2;stroke-dasharray:6 5;stroke-linejoin:round;}
+#checkmystocks .ln-grid{stroke:rgba(128,150,170,.25);stroke-width:1;}
+#checkmystocks .ln-txt{fill:var(--text3);font-size:10px;font-family:'Manrope',Arial,sans-serif;}
+#checkmystocks .rev-tip{display:none;position:absolute;z-index:5;pointer-events:none;min-width:150px;padding:10px 12px;border-radius:10px;background:var(--input);border:1px solid var(--cardline);box-shadow:0 10px 30px rgba(0,0,0,.25);font-size:11px;color:var(--text2);}
+#checkmystocks .rev-tip b{color:var(--text);display:block;font-size:12px;margin:3px 0;}
+#checkmystocks .rev-tip .tp{color:var(--kraft);}
+#checkmystocks .rev-legend{display:flex;gap:18px;color:var(--text3);font-size:10px;margin-top:8px;}
+#checkmystocks .rev-legend span:before{content:'';display:inline-block;width:16px;height:3px;border-radius:3px;margin-right:7px;vertical-align:2px;background:var(--sky);}
+#checkmystocks .rev-legend .lg-prev:before{background:var(--kraft);}
+
+#checkmystocks .bar-row{display:grid;grid-template-columns:minmax(90px,170px) 1fr minmax(100px,150px);gap:14px;align-items:center;margin:14px 0;font-size:12px;}
+#checkmystocks .bar-name{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#checkmystocks .bar-track{height:13px;border-radius:8px;background:rgba(128,150,170,.18);overflow:hidden;}
+#checkmystocks .bar-fill{height:100%;border-radius:8px;position:relative;overflow:hidden;background:linear-gradient(90deg,var(--sky),var(--accent));}
+#checkmystocks .bar-fill.tint{background:var(--c);}
+#checkmystocks .bar-dead{position:absolute;right:0;top:0;height:100%;background:#F26B6B;}
+#checkmystocks .bar-val{text-align:right;font-weight:800;color:var(--accent);font-variant-numeric:tabular-nums;}
+#checkmystocks .bar-val small{display:block;color:var(--text3);font-weight:500;font-size:10px;margin-top:3px;}
+#checkmystocks .key-note{display:flex;gap:16px;color:var(--text3);font-size:10px;margin-top:6px;}
+#checkmystocks .key-note span:before{content:'';display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px;background:var(--sky);}
+#checkmystocks .key-note .k-dead:before{background:#F26B6B;}
+#checkmystocks .mixbar{display:flex;gap:2px;height:28px;border-radius:14px;overflow:hidden;margin:6px 0 18px;}
+#checkmystocks .legend-row{display:grid;grid-template-columns:14px 1fr 100px 140px 46px;gap:10px;align-items:center;padding:11px 0;border-top:1px solid var(--line);font-size:12px;color:var(--text2);}
+#checkmystocks .legend-n,#checkmystocks .legend-p{text-align:right;}
+#checkmystocks .legend-v{text-align:right;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums;}
+
+#checkmystocks .action-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:6px;}
+#checkmystocks .action-card{padding:22px;border-radius:15px;border-top:3px solid var(--c);}
+#checkmystocks .action-num{color:var(--c);font-size:10px;font-weight:800;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;}
+#checkmystocks .action-big{font-size:clamp(19px,2vw,28px);font-weight:700;letter-spacing:-.6px;color:var(--text);overflow-wrap:anywhere;}
+#checkmystocks .action-card p{font-size:12px;line-height:1.75;color:var(--text2);margin:12px 0 0;}
+#checkmystocks .action-card p b{color:var(--accent);}
+
+#checkmystocks .toolbar{display:flex;gap:11px;margin:14px 0;}
+#checkmystocks .search-box{flex:1;min-width:180px;background:var(--card);border:1px solid var(--line);border-radius:9px;color:var(--text);padding:13px 15px;outline:none;font-size:12px;}
+#checkmystocks .search-box:focus{border-color:var(--sky);}
+#checkmystocks .search-box::placeholder{color:var(--text3);}
+#checkmystocks .filter-select{background:var(--input);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:11px 13px;font-size:12px;}
+#checkmystocks .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:13px;background:rgba(128,150,170,.05);}
+#checkmystocks table{width:100%;min-width:520px;border-collapse:collapse;font-size:12px;}
+#checkmystocks th{padding:14px 16px;color:var(--text3);background:var(--thead);text-transform:uppercase;letter-spacing:1px;font-size:9px;text-align:left;white-space:nowrap;}
+#checkmystocks th.number{text-align:right;}
+#checkmystocks td{padding:14px 16px;border-top:1px solid var(--line);color:var(--text);}
+#checkmystocks tbody tr{transition:background .2s;}
+#checkmystocks tbody tr:hover{background:rgba(128,150,170,.1);}
+#checkmystocks .number{text-align:right;font-variant-numeric:tabular-nums;}
+#checkmystocks .value{color:var(--accent);font-weight:800;}
+#checkmystocks .product-name{font-weight:700;font-size:12px;}
+#checkmystocks .product-category{color:var(--text3);font-size:10px;margin-top:5px;}
+#checkmystocks .chapter-nav{display:flex;justify-content:flex-end;margin-top:26px;}
+
+#checkmystocks .modal-backdrop{display:none;position:absolute;inset:0;z-index:20;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.72);backdrop-filter:blur(12px);}
+#checkmystocks .modal-backdrop.open{display:flex;}
+#checkmystocks .modal{width:min(500px,100%);padding:26px;border:1px solid rgba(255,255,255,.2);border-radius:17px;background:linear-gradient(145deg,#1B3550,#10222F);color:#EEF3F7;box-shadow:0 28px 90px rgba(0,0,0,.5);animation:modalEnter .25s ease both;}
+#checkmystocks .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:23px;}
+#checkmystocks .modal-head h3{font-size:18px;margin:0;}
+#checkmystocks .modal-close{width:34px;height:34px;border-radius:9px;color:white;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);font-size:20px;display:grid;place-items:center;}
+#checkmystocks .modal .metric-label{color:#B4C2CE;}
+#checkmystocks .modal-value{font-size:30px;color:#7DD3FC;font-weight:800;margin:8px 0 20px;}
+#checkmystocks .modal-row{display:flex;justify-content:space-between;padding:14px 0;border-top:1px solid rgba(255,255,255,.12);color:#B4C2CE;font-size:12px;}
+#checkmystocks .modal-row strong{color:white;}
+
+@keyframes heroEnter{from{opacity:0;transform:translateY(24px);}to{opacity:1;transform:translateY(0);}}
+@keyframes artEnter{from{opacity:0;transform:translateX(30px) scale(.95);}to{opacity:1;transform:translateX(0) scale(1);}}
+@keyframes cubeFloat{0%,100%{translate:0 0;rotate:-3deg;}50%{translate:0 -17px;rotate:2deg;}}
+@keyframes cardFloat{0%,100%{translate:0 0;rotate:-1deg;}50%{translate:0 -11px;rotate:1deg;}}
+@keyframes orbitSpin{from{transform:rotateX(65deg) rotateZ(-25deg);}to{transform:rotateX(65deg) rotateZ(335deg);}}
+@keyframes sparkle{0%,100%{opacity:.2;transform:scale(.7);}50%{opacity:1;transform:scale(1.6);}}
+@keyframes glowDrift{from{transform:translate(0,0) scale(1);}to{transform:translate(60px,35px) scale(1.2);}}
+@keyframes pageEnter{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
+@keyframes modalEnter{from{opacity:0;transform:translateY(12px) scale(.98);}to{opacity:1;transform:translateY(0) scale(1);}}
+@keyframes revealUp{from{opacity:0;transform:translateY(25px);}to{opacity:1;transform:translateY(0);}}
+
+@media(max-width:1000px){
+#checkmystocks .sidebar{width:200px;flex-basis:200px;}
+#checkmystocks .main{padding:22px;}
+#checkmystocks .story-cards{grid-template-columns:repeat(2,minmax(0,1fr));}
+#checkmystocks .landing-inner{grid-template-columns:1fr;}
+#checkmystocks .hero-art{min-height:420px;}
+}
+@media(max-width:860px){
+#checkmystocks .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+#checkmystocks .two-col,#checkmystocks .action-grid,#checkmystocks .forecast-grid,#checkmystocks .rev-sliders{grid-template-columns:1fr;}
+#checkmystocks .legend-row{grid-template-columns:14px 1fr 120px;}
+#checkmystocks .legend-n,#checkmystocks .legend-p{display:none;}
+}
+@media(max-width:560px){
+#checkmystocks .sidebar{width:62px;flex-basis:62px;padding:20px 8px;}
+#checkmystocks .brand{padding:0 0 24px;}
+#checkmystocks .brand > div:last-child,#checkmystocks .nav-label{display:none;}
+#checkmystocks .nav-item{font-size:0;justify-content:center;padding:13px 5px;}
+#checkmystocks .nav-icon{font-size:15px;}
+#checkmystocks .metric-grid,#checkmystocks .story-cards{grid-template-columns:1fr;}
+#checkmystocks .topbar{align-items:flex-start;flex-direction:column;}
+#checkmystocks .toolbar{flex-direction:column;}
+#checkmystocks .bar-row{grid-template-columns:1fr 1fr;}
+#checkmystocks .bar-track{grid-column:1 / 3;order:3;}
+}
+@media(prefers-reduced-motion:reduce){
+#checkmystocks *,#checkmystocks *:before,#checkmystocks *:after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;}
+}
+</style>"
+
+VAR _Landing =
+"<section class='landing'>
+    <div class='landing-glow glow-one'></div>
+    <div class='landing-glow glow-two'></div>
+    <div class='landing-inner'>
+        <div class='hero-copy'>
+            <div class='hero-overline'>Inventory intelligence system</div>
+            <h1 class='hero-name'>Check<span>my</span><br>stocks.</h1>
+            <div class='hero-tagline'>Know your stock. Stay in control.</div>
+            <p class='hero-description'>Your inventory is more than products on a shelf. It is money invested in your business. Four questions show you what you hold, what is stuck, what is slipping and what to restock.</p>
+            <div class='hero-actions'>
+                <div class='control primary-control' role='button' tabindex='0' data-action='enter'>Enter your workspace <span>→</span></div>
+                <span class='hero-caption'>A clearer view of your inventory</span>
+            </div>
+        </div>
+        <div class='hero-art'>
+            <div class='glass-orbit'></div>
+            <div class='glass-platform'></div>
+            <div class='inventory-cube cube-main'><div class='cube-inner'>▦</div></div>
+            <div class='inventory-cube cube-small cube-left'><div class='cube-inner'>◇</div></div>
+            <div class='inventory-cube cube-small cube-right'><div class='cube-inner'>⌁</div></div>
+            <div class='floating-glass-card glass float-card-one'>
+                <div class='float-label'>Cash held in stock</div>
+                <div class='float-value'>" & FORMAT(_InventoryValue, _CurrencyFormat) & "</div>
+                <div class='float-note'>Across " & FORMAT(_ProdCount, "#,##0") & " products</div>
+            </div>
+            <div class='floating-glass-card glass float-card-two'>
+                <div class='float-label'>Stuck in dead stock</div>
+                <div class='float-value'>" & FORMAT(_DeadStockPct, "0.0%") & "</div>
+                <div class='float-note'>of inventory value</div>
+            </div>
+            <span class='spark spark-a'></span><span class='spark spark-b'></span><span class='spark spark-c'></span>
+        </div>
+    </div>
+    <section class='landing-story'>
+        <div class='story-heading'>
+            <div class='story-kicker'>Four questions, one story</div>
+            <h2>Know what is happening beyond the stock count.</h2>
+            <p>A product on your shelf is money already spent. The important question is not only how much stock you have, but what that stock is doing for your business.</p>
+        </div>
+        <div class='story-cards'>
+            <div class='story-card glass'><div class='story-card-number'>01</div><h3>How much inventory do I currently have?</h3><p>Your current stock levels and the total value of your inventory.</p></div>
+            <div class='story-card glass'><div class='story-card-number'>02</div><h3>How much money is tied up in dead stock?</h3><p>Products that have not sold, and the money sitting in them.</p></div>
+            <div class='story-card glass'><div class='story-card-number'>03</div><h3>Which products are slow moving or at risk?</h3><p>Products whose movement may signal an inventory problem.</p></div>
+            <div class='story-card glass'><div class='story-card-number'>04</div><h3>Which products need replenishment?</h3><p>Products that are out of stock or approaching their reorder point.</p></div>
+        </div>
+    </section>
+    <section class='landing-cta glass'>
+        <div class='story-kicker'>Your inventory. One clearer view.</div>
+        <h2>Ready to take a closer look?</h2>
+        <p>Enter your workspace and explore the health of your inventory.</p>
+        <div class='control primary-control' role='button' tabindex='0' data-action='enter'>Open Checkmystocks →</div>
+    </section>
+    <div class='landing-footer'><span>Checkmystocks</span><span>Clarity in every stock decision</span></div>
+</section>"
+
+VAR _Sidebar =
+"<aside class='sidebar'>
+    <div class='brand'>
+        <div class='brand-mark'>C</div>
+        <div><div class='brand-name'>Checkmystocks</div><div class='brand-sub'>Inventory health</div></div>
+    </div>
+    <div class='nav-label'>The story</div>
+    <div class='nav-item active control' role='button' tabindex='0' data-screen='overview'><span class='nav-icon'>⌂</span> Overview</div>
+    <div class='nav-item control' role='button' tabindex='0' data-screen='c1'><span class='nav-icon'>01</span> Current inventory</div>
+    <div class='nav-item control' role='button' tabindex='0' data-screen='c2'><span class='nav-icon'>02</span> Dead stock</div>
+    <div class='nav-item control' role='button' tabindex='0' data-screen='c3'><span class='nav-icon'>03</span> Slow moving and at risk</div>
+    <div class='nav-item control' role='button' tabindex='0' data-screen='c4'><span class='nav-icon'>04</span> Replenishment</div>
+    <div class='nav-label'>Detail</div>
+    <div class='nav-item control' role='button' tabindex='0' data-screen='explorer'><span class='nav-icon'>▦</span> Inventory Explorer</div>
+    <div class='sidebar-bottom'><div class='system-status'><span class='status-dot'></span> Workspace active</div></div>
+</aside>"
+
+VAR _ScOverview =
+"<section id='overview' class='screen active'>
+    <div class='topbar'><div><div class='eyebrow'>Your inventory at a glance</div><h1>Overview</h1></div>" & _TopActions & "</div>
+    <div class='lead'>
+        <div class='lead-kicker'>The headline</div>
+        <p class='lead-title'>" & _LeadOverview & "</p>
+        <p class='lead-sub'>Click any card to see what sits behind the number.</p>
+    </div>
+    <div class='metric-grid'>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='ov1'><div class='metric-label'>Current Inventory Value</div><div class='metric-value accent'>" & FORMAT(_InventoryValue, _CurrencyFormat) & "</div><div class='metric-note'>" & FORMAT(_TotalUnits, "#,##0") & " units across " & FORMAT(_ProdCount, "#,##0") & " products</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='ov2'><div class='metric-label'>Money in Dead Stock</div><div class='metric-value'>" & FORMAT(_DeadStockValue, _CurrencyFormat) & "</div><div class='metric-note'>" & FORMAT(_DeadStockPct, "0.0%") & " of inventory value</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='ov3'><div class='metric-label'>Slow Moving or At Risk</div><div class='metric-value'>" & FORMAT(_SlowRiskCnt, "#,##0") & "</div><div class='metric-note'>" & FORMAT(_SlowRiskVal, _CurrencyFormat) & " of stock at stake</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='ov4'><div class='metric-label'>Need Replenishment</div><div class='metric-value'>" & FORMAT(_NeedAllCnt, "#,##0") & "</div><div class='metric-note'>" & FORMAT(_CntOut, "#,##0") & " out of stock, " & FORMAT(_CntBelow + _CntApproach, "#,##0") & " low</div></div>
+    </div>
+    <div class='kpi-detail' data-for='ov1'><div class='kd-note'>Your five largest products hold <b>" & FORMAT(_Top5Share, "0%") & "</b> of the value.</div><div class='kd-title'>Largest positions</div>" & _LstValue & "</div>
+    <div class='kpi-detail' data-for='ov2'><div class='kd-note'><b>" & FORMAT(_CntDead, "#,##0") & "</b> products have not sold in " & _DeadDays & " days or more.</div><div class='kd-title'>Most money tied up</div>" & _LstDead & "</div>
+    <div class='kpi-detail' data-for='ov3'><div class='kd-note'><b>" & FORMAT(_CntSlow, "#,##0") & "</b> are slow moving and <b>" & FORMAT(_CntRisk, "#,##0") & "</b> are at risk. <b>" & FORMAT(_SoonCnt, "#,##0") & "</b> could turn dead within " & _SoonDays & " days.</div><div class='kd-title'>Biggest holdings</div>" & _LstSlowRisk & "</div>
+    <div class='kpi-detail' data-for='ov4'><div class='kd-note'><b>" & FORMAT(_CntOut, "#,##0") & "</b> are out of stock, <b>" & FORMAT(_CntBelow, "#,##0") & "</b> are below their reorder point and <b>" & FORMAT(_CntApproach, "#,##0") & "</b> are approaching it.</div><div class='kd-title'>Most urgent</div>" & _LstNeed & "</div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>Revenue</div>
+        <div class='panel-subtitle'>Pick a period, group by day, week or month, and compare with the period before</div>
+        <div class='explainer' id='revExplain'></div>
+        <div class='rev-controls'>
+            <div class='chip-group'>
+                <span class='chip' role='button' tabindex='0' data-preset='30'>30 days</span>
+                <span class='chip' role='button' tabindex='0' data-preset='90'>90 days</span>
+                <span class='chip' role='button' tabindex='0' data-preset='365'>12 months</span>
+                <span class='chip' role='button' tabindex='0' data-preset='all'>All time</span>
+            </div>
+            <div class='chip-group'>
+                <span class='chip' role='button' tabindex='0' data-gran='day'>Day</span>
+                <span class='chip' role='button' tabindex='0' data-gran='week'>Week</span>
+                <span class='chip' role='button' tabindex='0' data-gran='month'>Month</span>
+            </div>
+            <div class='chip-group'><span class='chip' role='button' tabindex='0' data-compare='1'>Compare with previous period</span></div>
+        </div>
+        <div class='rev-sliders'>
+            <label>From <b id='revFromLbl'></b><input type='range' id='revFrom' min='0' max='0' value='0'></label>
+            <label>To <b id='revToLbl'></b><input type='range' id='revTo' min='0' max='0' value='0'></label>
+        </div>
+        <div class='rev-wrap'><div class='rev-chart' id='revChart'></div><div class='rev-tip' id='revTip'></div></div>
+        <div class='rev-legend'><span class='lg-now'>Selected period</span><span class='lg-prev'>Previous period</span></div>
+    </div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>Next 7 Days</div>
+        <div class='panel-subtitle'>A directional estimate if recent sales continue</div>
+        <div class='explainer'>Expect about <b>" & _RevenueForecastText & "</b> in revenue and <b>" & FORMAT(_ForecastUnits7Days, "#,##0") & "</b> units sold." & IF(_AverageDailyUnits > 0, " Current stock lasts about <b>" & FORMAT(_EstimatedStockCoverDays, "#,##0") & " days</b> at this pace.", "") & "</div>
+        <div class='forecast-grid'>
+            <div class='forecast-item'><div class='forecast-label'>Projected Revenue</div><div class='forecast-value'>" & _RevenueForecastText & "</div></div>
+            <div class='forecast-item'><div class='forecast-label'>Expected Units Sold</div><div class='forecast-value'>" & FORMAT(_ForecastUnits7Days, "#,##0") & "</div></div>
+            <div class='forecast-item'><div class='forecast-label'>Stock Lasts About</div><div class='forecast-value'>" & IF(_AverageDailyUnits > 0, FORMAT(_EstimatedStockCoverDays, "#,##0") & " days", "N/A") & "</div></div>
+        </div>
+    </div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>Business Performance</div>
+        <div class='panel-subtitle'>What your inventory is helping the business earn</div>
+        <div class='explainer'>Gross margin is <b>" & FORMAT(_Margin, "0.0%") & "</b>, and inventory turned over <b>" & FORMAT(_Turnover, "0.00") & " times</b>.</div>
+        <div class='progress-row'><div class='progress-label'><span>Revenue</span><strong>" & FORMAT(_Revenue, _CurrencyFormat) & "</strong></div><div class='progress-track'><div class='progress-fill' style='width:100%'></div></div></div>
+        <div class='progress-row'><div class='progress-label'><span>Cost of Goods Sold</span><strong>" & FORMAT(_COGS, _CurrencyFormat) & "</strong></div><div class='progress-track'><div class='progress-fill' style='width:" & FORMAT(MIN(100, DIVIDE(_COGS, _Revenue, 0) * 100), "0") & "%'></div></div></div>
+        <div class='progress-row'><div class='progress-label'><span>Gross Margin</span><strong>" & FORMAT(_Margin, "0.0%") & "</strong></div><div class='progress-track'><div class='progress-fill' style='width:" & FORMAT(MIN(100, MAX(0, _Margin * 100)), "0") & "%'></div></div></div>
+    </div>
+    <div class='chapter-nav'><div class='control primary-control' role='button' tabindex='0' data-screen='c1'>Start: How much inventory do I have? →</div></div>
+</section>"
+
+VAR _ScC1 =
+"<section id='c1' class='screen'>
+    <div class='topbar'><div><div class='eyebrow'>Question 1 of 4</div><h1>How much inventory do I currently have?</h1></div>" & _TopActions & "</div>
+    <div class='lead'>
+        <div class='lead-kicker'>The answer</div>
+        <p class='lead-title'>" & _LeadC1 & "</p>
+        <p class='lead-sub'>" & FORMAT(_HealthyPct, "0%") & " of that value is healthy stock that sells at a normal pace.</p>
+    </div>
+    <div class='metric-grid'>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c1a'><div class='metric-label'>Inventory Value</div><div class='metric-value accent'>" & FORMAT(_InventoryValue, _CurrencyFormat) & "</div><div class='metric-note'>Stock currently held</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c1b'><div class='metric-label'>Units in Stock</div><div class='metric-value'>" & FORMAT(_TotalUnits, "#,##0") & "</div><div class='metric-note'>Across all products</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c1c'><div class='metric-label'>Products Tracked</div><div class='metric-value'>" & FORMAT(_ProdCount, "#,##0") & "</div><div class='metric-note'>In " & FORMAT(_CatCount, "#,##0") & " categories</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c1d'><div class='metric-label'>Healthy Share of Value</div><div class='metric-value'>" & FORMAT(_HealthyPct, "0%") & "</div><div class='metric-note'>Stock selling normally</div></div>
+    </div>
+    <div class='kpi-detail' data-for='c1a'><div class='kd-note'>Your five largest products hold <b>" & FORMAT(_Top5Share, "0%") & "</b> of the value.</div><div class='kd-title'>Largest positions</div>" & _LstValue & "</div>
+    <div class='kpi-detail' data-for='c1b'><div class='kd-note'>That is about <b>" & FORMAT(DIVIDE(_TotalUnits, _ProdCount, 0), "#,##0") & "</b> units per product.</div><div class='kd-title'>Biggest piles</div>" & _LstUnits & "</div>
+    <div class='kpi-detail' data-for='c1c'><div class='kd-note'>Your catalogue spans <b>" & FORMAT(_CatCount, "#,##0") & "</b> categories.</div><div class='kd-title'>Largest categories by product count</div>" & _LstCats & "</div>
+    <div class='kpi-detail' data-for='c1d'><div class='kd-note'><b>" & FORMAT(_CntHealthy, "#,##0") & "</b> products have sold in the last " & (_SlowDays - 1) & " days.</div><div class='kd-title'>Healthiest holdings</div>" & _LstHealthy & "</div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>How healthy is the money in stock?</div>
+        <div class='panel-subtitle'>Inventory value by movement status</div>
+        <div class='explainer'>Most of your money is in healthy stock (<b>" & FORMAT(_HealthyPct, "0%") & "</b>). <b>" & FORMAT(_StuckPct, "0%") & "</b> is slow, at risk or dead.</div>
+        " & _MixBar & _MixLegend & "
+    </div>
+    <div class='two-col'>
+        <div class='panel glass'>
+            <div class='panel-title'>Where does the money sit?</div>
+            <div class='panel-subtitle'>Inventory value by category</div>
+            <div class='explainer'><b>" & _TopCatName & "</b> holds the most, at <b>" & FORMAT(_TopCatShare, "0%") & "</b>. Red shows the dead stock inside each category.</div>
+            " & _CatBars & "
+            <div class='key-note'><span>Stock value</span><span class='k-dead'>Dead stock</span></div>
+        </div>
+        <div class='panel glass'>
+            <div class='panel-title'>Five biggest positions</div>
+            <div class='panel-subtitle'>The products holding the most cash</div>
+            <div class='explainer'>These five products hold <b>" & FORMAT(_Top5Share, "0%") & "</b> of your inventory value.</div>
+            <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>Units</th><th class='number'>Value</th><th class='number'>Share</th><th>Status</th></tr></thead><tbody>" & _Top5Html & "</tbody></table></div>
+        </div>
+    </div>
+    <div class='chapter-nav'><div class='control primary-control' role='button' tabindex='0' data-screen='c2'>Next: Dead stock →</div></div>
+</section>"
+
+VAR _ScC2 =
+"<section id='c2' class='screen'>
+    <div class='topbar'><div><div class='eyebrow'>Question 2 of 4</div><h1>How much money is tied up in dead stock?</h1></div>" & _TopActions & "</div>
+    <div class='lead'>
+        <div class='lead-kicker'>The answer</div>
+        <p class='lead-title'>" & _LeadC2 & "</p>
+        <p class='lead-sub'>The longest has gone <b>" & FORMAT(_MaxDeadDays, "#,##0") & " days</b> without a sale.</p>
+    </div>
+    <div class='metric-grid'>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c2a'><div class='metric-label'>Dead Stock Value</div><div class='metric-value accent'>" & FORMAT(_DeadStockValue, _CurrencyFormat) & "</div><div class='metric-note'>No sale in " & _DeadDays & " days or more</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c2b'><div class='metric-label'>Share of Inventory Value</div><div class='metric-value'>" & FORMAT(_DeadStockPct, "0.0%") & "</div><div class='metric-note'>Dead stock against all stock</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c2c'><div class='metric-label'>Dead Stock Products</div><div class='metric-value'>" & FORMAT(_CntDead, "#,##0") & "</div><div class='metric-note'>" & FORMAT(DIVIDE(_CntDead, _ProdCount, 0), "0%") & " of your products</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c2d'><div class='metric-label'>Longest Without a Sale</div><div class='metric-value'>" & FORMAT(_MaxDeadDays, "#,##0") & " days</div><div class='metric-note'>Oldest dead stock product</div></div>
+    </div>
+    <div class='kpi-detail' data-for='c2a'><div class='kd-note'>The biggest products here hold most of the trapped cash.</div><div class='kd-title'>Most money tied up</div>" & _LstDead & "</div>
+    <div class='kpi-detail' data-for='c2b'><div class='kd-note'><b>" & _TopDeadCat & "</b> carries the most dead stock.</div><div class='kd-title'>Dead stock by category</div>" & _LstDeadCat & "</div>
+    <div class='kpi-detail' data-for='c2c'><div class='kd-note'>Dead stock makes up <b>" & FORMAT(DIVIDE(_CntDead, _ProdCount, 0), "0%") & "</b> of your catalogue.</div><div class='kd-title'>Biggest piles</div>" & _LstDeadUnits & "</div>
+    <div class='kpi-detail' data-for='c2d'><div class='kd-note'>These have waited the longest for a buyer.</div><div class='kd-title'>Oldest dead stock</div>" & _LstOldest & "</div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>How long has it been dead?</div>
+        <div class='panel-subtitle'>Dead stock value by time since the last sale</div>
+        <div class='explainer'><b>" & FORMAT(_YearPlusVal, _CurrencyFormat) & "</b> has gone a year or more without a sale. The older the stock, the harder it is to sell.</div>
+        " & _AgingBars & "
+    </div>
+    <div class='section-heading'><h2>Dead stock products</h2><p>Sorted by money tied up. Showing the top " & MIN(25, _CntDead) & " of " & FORMAT(_CntDead, "#,##0") & ".</p></div>
+    <div class='explainer'>The first few rows hold most of the trapped cash. Clear these first.</div>
+    <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>Units Held</th><th class='number'>Last Sale</th><th class='number'>Stock Value</th><th class='number'>Share of Dead Stock</th></tr></thead><tbody>" & _DeadRows & "</tbody></table></div>
+    <div class='chapter-nav'><div class='control primary-control' role='button' tabindex='0' data-screen='c3'>Next: Slow moving and at risk →</div></div>
+</section>"
+
+VAR _ScC3 =
+"<section id='c3' class='screen'>
+    <div class='topbar'><div><div class='eyebrow'>Question 3 of 4</div><h1>Which products are slow moving or at risk?</h1></div>" & _TopActions & "</div>
+    <div class='lead'>
+        <div class='lead-kicker'>The answer</div>
+        <p class='lead-title'>" & _LeadC3 & "</p>
+        <p class='lead-sub'>Slow Moving means the last sale was " & _SlowDays & " to " & (_AtRiskDays - 1) & " days ago. At Risk means " & _AtRiskDays & " to " & (_DeadDays - 1) & " days ago. After " & _DeadDays & " days it becomes dead stock.</p>
+    </div>
+    <div class='metric-grid'>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c3a'><div class='metric-label'>Slow Moving Products</div><div class='metric-value'>" & FORMAT(_CntSlow, "#,##0") & "</div><div class='metric-note'>" & FORMAT(_ValSlow, _CurrencyFormat) & " in stock</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c3b'><div class='metric-label'>At Risk Products</div><div class='metric-value'>" & FORMAT(_CntRisk, "#,##0") & "</div><div class='metric-note'>" & FORMAT(_ValRisk, _CurrencyFormat) & " in stock</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c3c'><div class='metric-label'>Value at Stake</div><div class='metric-value accent'>" & FORMAT(_SlowRiskVal, _CurrencyFormat) & "</div><div class='metric-note'>" & FORMAT(DIVIDE(_SlowRiskVal, _SumValue, 0), "0%") & " of inventory value</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c3d'><div class='metric-label'>Close to Turning Dead</div><div class='metric-value'>" & FORMAT(_SoonCnt, "#,##0") & "</div><div class='metric-note'>Within " & _SoonDays & " days of dead stock</div></div>
+    </div>
+    <div class='kpi-detail' data-for='c3a'><div class='kd-note'>These are still selling, but slowly.</div><div class='kd-title'>Biggest slow moving holdings</div>" & _LstSlow & "</div>
+    <div class='kpi-detail' data-for='c3b'><div class='kd-note'>These have gone quiet and need a push soon.</div><div class='kd-title'>Biggest at risk holdings</div>" & _LstRisk & "</div>
+    <div class='kpi-detail' data-for='c3c'><div class='kd-note'>This money is still recoverable if you act now.</div><div class='kd-title'>Biggest holdings</div>" & _LstSlowRisk & "</div>
+    <div class='kpi-detail' data-for='c3d'><div class='kd-note'><b>" & FORMAT(_SoonVal, _CurrencyFormat) & "</b> will become dead stock unless these sell.</div><div class='kd-title'>Closest to the line</div>" & _LstSoon & "</div>
+
+    <div class='panel glass'>
+        <div class='panel-title'>The slide towards dead stock</div>
+        <div class='panel-subtitle'>Stock value at each stage</div>
+        <div class='explainer'>Products drift from slow, to at risk, to dead. <b>" & FORMAT(_SoonCnt, "#,##0") & "</b> are about to cross the line.</div>
+        " & _Ladder & "
+    </div>
+    <div class='section-heading'><h2>Slow moving and at risk products</h2><p>Closest to dead stock first. Showing the top " & MIN(15, _SlowRiskCnt) & " of " & FORMAT(_SlowRiskCnt, "#,##0") & ".</p></div>
+    <div class='explainer'>The longer a product waits, the closer it is to dead stock. A promotion on these now costs less than a clearance later.</div>
+    <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>Units Held</th><th class='number'>Since Last Sale</th><th class='number'>Stock Value</th><th>Status</th></tr></thead><tbody>" & _SlowRiskTableRows & "</tbody></table></div>
+    <div class='chapter-nav'><div class='control primary-control' role='button' tabindex='0' data-screen='c4'>Next: Replenishment →</div></div>
+</section>"
+
+VAR _ScC4 =
+"<section id='c4' class='screen'>
+    <div class='topbar'><div><div class='eyebrow'>Question 4 of 4</div><h1>Which products need replenishment?</h1></div>" & _TopActions & "</div>
+    <div class='lead'>
+        <div class='lead-kicker'>The answer</div>
+        <p class='lead-title'>" & _LeadC4 & "</p>
+        <p class='lead-sub'>Approaching means stock is within 20% of the reorder point. Products with no sale in " & _DeadDays & " days are listed separately so you check demand before buying.</p>
+    </div>
+    <div class='metric-grid'>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c4a'><div class='metric-label'>Out of Stock</div><div class='metric-value'>" & FORMAT(_OutOfStock, "#,##0") & "</div><div class='metric-note'>" & FORMAT(_OutRecent, "#,##0") & " sold in the last " & _DeadDays & " days</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c4b'><div class='metric-label'>Below Reorder Point</div><div class='metric-value'>" & FORMAT(_CntBelow, "#,##0") & "</div><div class='metric-note'>In stock but running low</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c4c'><div class='metric-label'>Approaching Reorder Point</div><div class='metric-value'>" & FORMAT(_CntApproach, "#,##0") & "</div><div class='metric-note'>Plan these next</div></div>
+        <div class='metric-card glass kpi' role='button' tabindex='0' data-kpi='c4d'><div class='metric-label'>Cost to Restore</div><div class='metric-value accent'>" & FORMAT(_NeedCost, _CurrencyFormat) & "</div><div class='metric-note'>For products still selling</div></div>
+    </div>
+    <div class='kpi-detail' data-for='c4a'><div class='kd-note'><b>" & FORMAT(_OutRecent, "#,##0") & "</b> of these sold recently, so customers may be going without.</div><div class='kd-title'>Most recently sold</div>" & _LstOOS & "</div>
+    <div class='kpi-detail' data-for='c4b'><div class='kd-note'>These are at or under their reorder point.</div><div class='kd-title'>Fastest sellers first</div>" & _LstBelow & "</div>
+    <div class='kpi-detail' data-for='c4c'><div class='kd-note'>These are close to their reorder point.</div><div class='kd-title'>Fastest sellers first</div>" & _LstApproach & "</div>
+    <div class='kpi-detail' data-for='c4d'><div class='kd-note'>This is what it takes to bring every selling product back to its reorder point.</div><div class='kd-title'>Largest restocks</div>" & _LstCost & "</div>
+
+    <div class='section-heading'><h2>What should I do next?</h2><p>Three moves, in this order</p></div>
+    <div class='action-grid'>
+        <div class='action-card glass s-healthy'>
+            <div class='action-num'>1 Reorder now</div>
+            <div class='action-big'>" & FORMAT(_NeedCost, _CurrencyFormat) & "</div>
+            <p><b>" & FORMAT(_NeedNowCnt, "#,##0") & "</b> " & IF(_NeedNowCnt = 1, "product needs", "products need") & " restocking." & IF(_NeedNowCnt = 0, "", " Start with <b>" & _NeedNames & "</b>.") & "</p>
+        </div>
+        <div class='action-card glass s-at-risk'>
+            <div class='action-num'>2 Stop buying</div>
+            <div class='action-big'>" & FORMAT(_HoldValue, _CurrencyFormat) & "</div>
+            <p><b>" & FORMAT(_HoldCnt, "#,##0") & "</b> products are slow, at risk or dead. Pause purchases until they sell down." & IF(_HoldCnt = 0, "", " Largest: <b>" & _HoldNames & "</b>.") & "</p>
+        </div>
+        <div class='action-card glass s-dead-stock'>
+            <div class='action-num'>3 Release cash</div>
+            <div class='action-big'>" & FORMAT(_DeadStockValue, _CurrencyFormat) & "</div>
+            <p>is stuck in dead stock. Recovering half at cost would free about <b>" & FORMAT(_HalfDead, _CurrencyFormat) & "</b>, " & IF(_HalfDead >= _NeedCost, "enough to fund the whole restock.", "about " & FORMAT(DIVIDE(_HalfDead, _NeedCost, 0), "0%") & " of the restock cost.") & "</p>
+        </div>
+    </div>
+
+    <div class='section-heading'><h2>Reorder list</h2><p>Out of stock and below reorder point come first. Top " & MIN(15, _NeedNowCnt) & " of " & FORMAT(_NeedNowCnt, "#,##0") & ".</p></div>
+    <div class='explainer'>These products sold in the last " & _DeadDays & " days. Short By is how far each is under its reorder point.</div>
+    <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>In Stock</th><th class='number'>Reorder Point</th><th class='number'>Last Sale</th><th class='number'>Short By</th><th class='number'>Est. Cost</th><th>Priority</th></tr></thead><tbody>" & _NeedTableRows & "</tbody></table></div>
+
+    <div class='two-col'>
+        <div class='panel glass'>
+            <div class='panel-title'>Check demand before reordering</div>
+            <div class='panel-subtitle'>" & FORMAT(_NeedReviewCnt, "#,##0") & " low or empty products with no sale in " & _DeadDays & " days or more</div>
+            <div class='explainer'>Low stock here may be a sign of no demand, not a gap to fill.</div>
+            <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>In Stock</th><th class='number'>Reorder Point</th><th class='number'>Last Sale</th><th>Status</th></tr></thead><tbody>" & _ReviewRows & "</tbody></table></div>
+        </div>
+        <div class='panel glass'>
+            <div class='panel-title'>Do not reorder</div>
+            <div class='panel-subtitle'>Largest holdings that are slow, at risk or dead</div>
+            <div class='explainer'>Buying more of these only ties up more cash.</div>
+            <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>Units</th><th class='number'>Last Sale</th><th class='number'>Value</th><th>Status</th></tr></thead><tbody>" & _HoldTableRows & "</tbody></table></div>
+        </div>
+    </div>
+</section>"
+
+VAR _ScExplorer =
+"<section id='explorer' class='screen'>
+    <div class='topbar'><div><div class='eyebrow'>Product level detail</div><h1>Inventory Explorer</h1></div>" & _TopActions & "</div>
+    <div class='explainer'>All <b>" & FORMAT(_ProdCount, "#,##0") & "</b> products, largest value first. Search, filter by status, or click a row for detail.</div>
+    <div class='toolbar'>
+        <input id='productSearch' class='search-box' placeholder='Search for a product...'>
+        <select id='statusFilter' class='filter-select'><option value='all'>All statuses</option></select>
+    </div>
+    <div class='table-wrap'><table><thead><tr><th>Product</th><th class='number'>Units in Stock</th><th class='number'>Unit Cost</th><th class='number'>Inventory Value</th><th>Movement Status</th></tr></thead><tbody id='productTable'>" & _ProductRows & "</tbody></table></div>
+    <div id='productCount' class='metric-note' style='margin-top:14px'></div>
+</section>"
+
+VAR _Modal =
+"<div id='checkProductModal' class='modal-backdrop'>
+    <div class='modal'>
+        <div class='modal-head'><h3 id='modalProductName'>Product Details</h3><div class='modal-close control' role='button' tabindex='0' data-action='close-modal'>×</div></div>
+        <div class='metric-label'>Inventory value</div>
+        <div id='modalProductValue' class='modal-value'>₦0</div>
+        <div class='modal-row'><span>Units in stock</span><strong id='modalProductStock'>0</strong></div>
+        <div class='modal-row'><span>Unit cost</span><strong id='modalProductCost'>₦0</strong></div>
+        <div class='modal-row'><span>Movement status</span><strong id='modalProductStatus'>None</strong></div>
+    </div>
+</div>"
+
+VAR _Script =
+"<script>
+(function() {
+    const app = document.getElementById('checkmystocks');
+    if (!app || app.dataset.initialized === 'true') return;
+    app.dataset.initialized = 'true';
+
+    const RAW = '" & _DailyData & "';
+    const DAY = 86400000;
+    const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const rows = RAW ? RAW.split(',').map(function(s) {
+        const p = s.split(':');
+        return {t: Date.parse(p[0] + 'T00:00:00Z'), v: parseFloat(p[1]) || 0};
+    }).filter(function(r) { return isFinite(r.t); }) : [];
+    const st = {from: 0, to: Math.max(rows.length - 1, 0), gran: 'month', cmp: false, preset: 'all'};
+    let ctx = null;
+
+    function fmtDate(t) { const d = new Date(t); return d.getUTCDate() + ' ' + MON[d.getUTCMonth()] + ' ' + d.getUTCFullYear(); }
+    function fmtShort(t, g) {
+        const d = new Date(t);
+        return g === 'month' ? MON[d.getUTCMonth()] + ' ' + String(d.getUTCFullYear()).slice(2) : d.getUTCDate() + ' ' + MON[d.getUTCMonth()];
+    }
+    function bucketLabel(t, g) {
+        if (g === 'day') return fmtDate(t);
+        if (g === 'week') return 'Week of ' + fmtDate(t);
+        const d = new Date(t);
+        return MON[d.getUTCMonth()] + ' ' + d.getUTCFullYear();
+    }
+    function money(n) { return '₦' + Math.round(n).toLocaleString('en-US'); }
+    function compact(n) {
+        const a = Math.abs(n);
+        if (a >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+        if (a >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+        if (a >= 1e3) return Math.round(n / 1e3) + 'K';
+        return String(Math.round(n));
+    }
+    function bucketKey(t, g) {
+        if (g === 'day') return t;
+        const d = new Date(t);
+        if (g === 'month') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+        return t - ((d.getUTCDay() + 6) % 7) * DAY;
+    }
+    function aggregate(list, g) {
+        const m = {};
+        list.forEach(function(r) { const k = bucketKey(r.t, g); m[k] = (m[k] || 0) + r.v; });
+        return Object.keys(m).map(Number).sort(function(a, b) { return a - b; }).map(function(k) { return {t: k, v: m[k]}; });
+    }
+    function sum(list) { return list.reduce(function(a, r) { return a + r.v; }, 0); }
+
+    function drawRevenue(A, B, g) {
+        const box = app.querySelector('#revChart');
+        const W = Math.max(box.clientWidth, 320), H = 250, L = 56, R = 16, T = 14, Bm = 32;
+        const n = Math.max(A.length, B.length);
+        const all = A.concat(B).map(function(p) { return p.v; });
+        const maxV = Math.max(1, Math.max.apply(null, all)) * 1.1;
+        const X = function(i) { return n < 2 ? L + (W - L - R) / 2 : L + (W - L - R) * i / (n - 1); };
+        const Y = function(v) { return T + (H - T - Bm) * (1 - v / maxV); };
+        const path = function(S) {
+            return S.map(function(p, i) { return (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(p.v).toFixed(1); }).join(' ');
+        };
+        let grid = '';
+        for (let k = 0; k <= 4; k++) {
+            const v = maxV * k / 4, y = Y(v);
+            grid += `<line class='ln-grid' x1='${L}' x2='${W - R}' y1='${y.toFixed(1)}' y2='${y.toFixed(1)}'/><text class='ln-txt' x='${L - 8}' y='${(y + 3).toFixed(1)}' text-anchor='end'>${compact(v)}</text>`;
+        }
+        let xl = '';
+        const cnt = Math.min(6, A.length);
+        for (let k = 0; k < cnt; k++) {
+            const i = cnt === 1 ? 0 : Math.round(k * (A.length - 1) / (cnt - 1));
+            const anchor = k === 0 ? 'start' : (k === cnt - 1 ? 'end' : 'middle');
+            xl += `<text class='ln-txt' x='${X(i).toFixed(1)}' y='${H - 10}' text-anchor='${anchor}'>${fmtShort(A[i].t, g)}</text>`;
+        }
+        const y0 = Y(0).toFixed(1);
+        const area = A.length > 1 ? `<path d='${path(A)} L${X(A.length - 1).toFixed(1)},${y0} L${X(0).toFixed(1)},${y0} Z' fill='url(#revFill)'/>` : '';
+        const prev = B.length > 1 ? `<path class='ln-prev' d='${path(B)}'/>` : '';
+        const dot = A.length === 1 ? `<circle cx='${X(0).toFixed(1)}' cy='${Y(A[0].v).toFixed(1)}' r='4' style='fill:var(--sky)'/>` : '';
+        box.innerHTML = `<svg viewBox='0 0 ${W} ${H}' width='${W}' height='${H}'><defs><linearGradient id='revFill' x1='0' y1='0' x2='0' y2='1'><stop offset='0%' style='stop-color:var(--sky);stop-opacity:.3'/><stop offset='100%' style='stop-color:var(--sky);stop-opacity:0'/></linearGradient></defs>${grid}${xl}${area}${prev}<path class='ln-now' d='${path(A)}'/>${dot}<line id='revCross' y1='${T}' y2='${H - Bm}' style='stroke:var(--text3);stroke-width:1;display:none'/><circle id='revDotA' r='4.5' style='fill:var(--sky);display:none'/><circle id='revDotB' r='4' style='fill:var(--kraft);display:none'/></svg>`;
+        ctx = {A: A, B: B, g: g, X: X, Y: Y, n: n, W: W, L: L, R: R};
+    }
+
+    function renderRevenue() {
+        const box = app.querySelector('#revChart');
+        if (!box) return;
+        const ex = app.querySelector('#revExplain');
+        if (!rows.length) {
+            box.innerHTML = `<div class='chart-empty'>No revenue recorded yet.</div>`;
+            if (ex) ex.textContent = 'No revenue has been recorded for the current selection.';
+            return;
+        }
+        const fromEl = app.querySelector('#revFrom'), toEl = app.querySelector('#revTo');
+        fromEl.max = rows.length - 1; toEl.max = rows.length - 1;
+        fromEl.value = st.from; toEl.value = st.to;
+        const a = rows[st.from].t, b = rows[st.to].t;
+        app.querySelector('#revFromLbl').textContent = fmtDate(a);
+        app.querySelector('#revToLbl').textContent = fmtDate(b);
+        const cur = rows.filter(function(r) { return r.t >= a && r.t <= b; });
+        const span = Math.round((b - a) / DAY) + 1;
+        const pb = a - DAY, pa = pb - (span - 1) * DAY;
+        const hasPrev = pa >= rows[0].t;
+        const prev = hasPrev ? rows.filter(function(r) { return r.t >= pa && r.t <= pb; }) : [];
+        const A = aggregate(cur, st.gran);
+        const B = st.cmp && hasPrev ? aggregate(prev, st.gran) : [];
+        drawRevenue(A, B, st.gran);
+        const totA = sum(cur), totB = sum(prev);
+        let best = A[0];
+        A.forEach(function(p) { if (p.v > best.v) best = p; });
+        let s = 'From <b>' + fmtDate(a) + '</b> to <b>' + fmtDate(b) + '</b>, revenue was <b>' + money(totA) + '</b>.';
+        if (st.cmp) {
+            if (hasPrev && totB > 0) {
+                const d = (totA - totB) / totB;
+                s += ' That is <b>' + (d >= 0 ? 'up ' : 'down ') + Math.abs(d * 100).toFixed(0) + '%</b> on the previous ' + span + ' days (' + money(totB) + ').';
+            } else {
+                s += ' There is no earlier period of the same length to compare with.';
+            }
+        }
+        s += ' Best ' + st.gran + ': <b>' + bucketLabel(best.t, st.gran) + '</b> at ' + money(best.v) + '.';
+        if (ex) ex.innerHTML = s;
+        app.querySelectorAll('[data-preset]').forEach(function(c) { c.classList.toggle('on', c.dataset.preset === st.preset); });
+        app.querySelectorAll('[data-gran]').forEach(function(c) { c.classList.toggle('on', c.dataset.gran === st.gran); });
+        app.querySelectorAll('[data-compare]').forEach(function(c) { c.classList.toggle('on', st.cmp); });
+    }
+
+    function applyPreset(p) {
+        if (!rows.length) return;
+        const last = rows.length - 1;
+        st.preset = p;
+        st.to = last;
+        if (p === 'all') { st.from = 0; st.gran = 'month'; }
+        else {
+            const n = parseInt(p, 10);
+            const startT = rows[last].t - (n - 1) * DAY;
+            let i = 0;
+            while (i < last && rows[i].t < startT) i++;
+            st.from = i;
+            st.gran = n <= 30 ? 'day' : (n <= 90 ? 'week' : 'month');
+        }
+        renderRevenue();
+    }
+
+    function revHover(e) {
+        const tip = app.querySelector('#revTip');
+        const box = app.querySelector('#revChart');
+        if (!ctx || !tip || !ctx.A.length) return;
+        const rect = box.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        let i = ctx.n < 2 ? 0 : Math.round((x - ctx.L) / (ctx.W - ctx.L - ctx.R) * (ctx.n - 1));
+        i = Math.max(0, Math.min(ctx.n - 1, i));
+        const pa = ctx.A[Math.min(i, ctx.A.length - 1)];
+        const pb = ctx.B[i];
+        const cx = ctx.X(i);
+        const cross = app.querySelector('#revCross'), da = app.querySelector('#revDotA'), db = app.querySelector('#revDotB');
+        cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.style.display = '';
+        da.setAttribute('cx', cx); da.setAttribute('cy', ctx.Y(pa.v)); da.style.display = '';
+        if (pb) { db.setAttribute('cx', cx); db.setAttribute('cy', ctx.Y(pb.v)); db.style.display = ''; } else { db.style.display = 'none'; }
+        tip.innerHTML = bucketLabel(pa.t, ctx.g) + '<b>' + money(pa.v) + '</b>' + (pb ? '<span class=\'tp\'>' + bucketLabel(pb.t, ctx.g) + '</span><b>' + money(pb.v) + '</b>' : '');
+        tip.style.display = 'block';
+        const tw = tip.offsetWidth;
+        tip.style.left = Math.max(0, Math.min(ctx.W - tw, cx + 14)) + 'px';
+        tip.style.top = '10px';
+    }
+    function revLeave() {
+        const tip = app.querySelector('#revTip');
+        if (tip) tip.style.display = 'none';
+        ['#revCross', '#revDotA', '#revDotB'].forEach(function(id) {
+            const el = app.querySelector(id);
+            if (el) el.style.display = 'none';
+        });
+    }
+
+    function toggleKpi(card) {
+        const scr = card.closest('.screen');
+        const id = card.dataset.kpi;
+        const target = scr.querySelector('.kpi-detail[data-for=' + id + ']');
+        const wasOpen = target && target.classList.contains('open');
+        scr.querySelectorAll('.kpi-detail').forEach(function(d) { d.classList.remove('open'); });
+        scr.querySelectorAll('.kpi').forEach(function(k) { k.classList.remove('open'); });
+        if (target && !wasOpen) { target.classList.add('open'); card.classList.add('open'); }
+    }
+
+    function scrollMainTop() { const m = app.querySelector('.main'); if (m) m.scrollTop = 0; }
+    function switchScreen(name) {
+        app.querySelectorAll('.screen').forEach(function(s) { s.classList.toggle('active', s.id === name); });
+        app.querySelectorAll('.nav-item').forEach(function(i) { i.classList.toggle('active', i.dataset.screen === name); });
+        scrollMainTop();
+        if (name === 'overview') renderRevenue();
+    }
+    function enterWorkspace() { app.classList.add('workspace-open'); switchScreen('overview'); }
+    function returnHome() {
+        app.classList.remove('workspace-open');
+        const l = app.querySelector('.landing');
+        if (l) l.scrollTop = 0;
+    }
+    function toggleTheme() { app.classList.toggle('light-mode'); }
+    function closeModal() { app.querySelector('#checkProductModal').classList.remove('open'); }
+
+    function showProduct(row) {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 5) return;
+        app.querySelector('#modalProductName').textContent = cells[0].innerText.split('\n')[0];
+        app.querySelector('#modalProductStock').textContent = cells[1].innerText;
+        app.querySelector('#modalProductCost').textContent = cells[2].innerText;
+        app.querySelector('#modalProductValue').textContent = cells[3].innerText;
+        app.querySelector('#modalProductStatus').textContent = cells[4].innerText;
+        app.querySelector('#checkProductModal').classList.add('open');
+    }
+
+    function buildOptions(tableId, selectId) {
+        const sel = app.querySelector('#' + selectId);
+        if (!sel) return;
+        const seen = {}, list = [];
+        app.querySelectorAll('#' + tableId + ' .product-row').forEach(function(r) {
+            const k = r.dataset.statusKey;
+            if (k && !seen[k]) { seen[k] = true; list.push({key: k, label: r.dataset.status || k}); }
+        });
+        const order = ['healthy', 'slow-moving', 'at-risk', 'dead-stock', 'no-stock', 'no-sales'];
+        list.sort(function(a, b) {
+            const ia = order.indexOf(a.key), ib = order.indexOf(b.key);
+            return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+        });
+        list.forEach(function(item) {
+            const o = document.createElement('option');
+            o.value = item.key; o.textContent = item.label;
+            sel.appendChild(o);
+        });
+    }
+    function filterRows() {
+        const searchEl = app.querySelector('#productSearch'), filterEl = app.querySelector('#statusFilter');
+        if (!searchEl || !filterEl) return;
+        const q = (searchEl.value || '').toLowerCase().trim();
+        const status = filterEl.value;
+        let count = 0;
+        app.querySelectorAll('#productTable .product-row').forEach(function(row) {
+            const ok = (row.dataset.name || '').toLowerCase().indexOf(q) > -1 && (status === 'all' || row.dataset.statusKey === status);
+            row.style.display = ok ? '' : 'none';
+            if (ok) count++;
+        });
+        const c = app.querySelector('#productCount');
+        if (c) c.textContent = count + ' products displayed';
+    }
+
+    app.addEventListener('click', function(event) {
+        const kpi = event.target.closest('[data-kpi]');
+        if (kpi && app.contains(kpi)) { toggleKpi(kpi); return; }
+        const chip = event.target.closest('.chip');
+        if (chip && app.contains(chip)) {
+            if (chip.dataset.preset) applyPreset(chip.dataset.preset);
+            else if (chip.dataset.gran) { st.gran = chip.dataset.gran; renderRevenue(); }
+            else if (chip.dataset.compare) { st.cmp = !st.cmp; renderRevenue(); }
+            return;
+        }
+        const control = event.target.closest('[data-action],[data-screen]');
+        if (control && app.contains(control)) {
+            if (control.dataset.screen) { switchScreen(control.dataset.screen); return; }
+            switch (control.dataset.action) {
+                case 'enter': enterWorkspace(); break;
+                case 'home': returnHome(); break;
+                case 'theme': toggleTheme(); renderRevenue(); break;
+                case 'close-modal': closeModal(); break;
+            }
+            return;
+        }
+        const row = event.target.closest('#productTable .product-row');
+        if (row && app.contains(row)) { showProduct(row); return; }
+        if (event.target === app.querySelector('#checkProductModal')) closeModal();
+    });
+
+    app.addEventListener('keydown', function(event) {
+        if (event.key === 'Escape') { closeModal(); return; }
+        const control = event.target.closest('[role=button]');
+        if (!control) return;
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); control.click(); }
+    });
+
+    const rf = app.querySelector('#revFrom'), rt = app.querySelector('#revTo'), rc = app.querySelector('#revChart');
+    if (rf) rf.addEventListener('input', function() {
+        st.from = parseInt(rf.value, 10);
+        if (st.from > st.to) st.to = st.from;
+        st.preset = '';
+        renderRevenue();
+    });
+    if (rt) rt.addEventListener('input', function() {
+        st.to = parseInt(rt.value, 10);
+        if (st.to < st.from) st.from = st.to;
+        st.preset = '';
+        renderRevenue();
+    });
+    if (rc) { rc.addEventListener('mousemove', revHover); rc.addEventListener('mouseleave', revLeave); }
+    window.addEventListener('resize', renderRevenue);
+
+    buildOptions('productTable', 'statusFilter');
+    const ps = app.querySelector('#productSearch'), sf = app.querySelector('#statusFilter');
+    if (ps) ps.addEventListener('input', filterRows);
+    if (sf) sf.addEventListener('change', filterRows);
+    app.querySelectorAll('#productTable .product-row').forEach(function(r) { r.style.cursor = 'pointer'; });
+    filterRows();
+    renderRevenue();
+
+    const landing = app.querySelector('.landing');
+    const items = app.querySelectorAll('.story-heading,.story-card,.landing-cta');
+    if ('IntersectionObserver' in window && landing) {
+        const obs = new IntersectionObserver(function(entries) {
+            entries.forEach(function(en) {
+                if (en.isIntersecting) { en.target.style.animation = 'revealUp .7s ease both'; obs.unobserve(en.target); }
+            });
+        }, {root: landing, threshold: .12});
+        items.forEach(function(i) { obs.observe(i); });
+    }
+})();
+</script>"
+
+RETURN
+    "<div id='checkmystocks'>" &
+    _CSS &
+    _Landing &
+    "<div class='workspace'>" & _Sidebar & "<main class='main'>" &
+    _ScOverview & _ScC1 & _ScC2 & _ScC3 & _ScC4 & _ScExplorer &
+    "</main></div>" &
+    _Modal &
+    _Script &
+    "</div>"
