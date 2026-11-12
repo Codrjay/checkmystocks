@@ -6,8 +6,6 @@ Checkmystocks is an inventory intelligence application built inside Microsoft Po
 
 It is not a dashboard that lists quantities and revenue. It is a decision-support tool built around one idea: **inventory is money you have already spent, and the real question is what that money is doing for your business.**
 
-> Screenshots: add your captures to the `screenshots/` folder and link them here. See [screenshots/README.md](screenshots/README.md).
-
 ---
 
 ## The problem
